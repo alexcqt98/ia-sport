@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>NovaPredict — Prédictions</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 0; background:#0b0f14; color:#e6edf3; }
+    header { padding: 24px; border-bottom:1px solid #1f2937; display:flex; justify-content:space-between; align-items:center;}
+    .brand { font-weight:700; letter-spacing:.3px; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .controls { display:flex; gap:12px; margin-bottom:16px; }
+    input, select, button {
+      background:#0f1720; color:#e6edf3; border:1px solid #223042; border-radius:10px; padding:10px 12px;
+    }
+    table { width:100%; border-collapse: collapse; overflow: hidden; border-radius: 12px; }
+    th, td { padding:12px; border-bottom:1px solid #1f2937; text-align:left; }
+    th { background: #101826; }
+    .badge { font-size:12px; padding:4px 8px; border-radius:8px; border:1px solid #2f4a66; }
+    .ok { color:#22c55e; border-color:#14532d; }
+    .warn { color:#f59e0b; border-color:#7c4a03; }
+  </style>
+  <script>
+    window.API_BASE = "https://ia-sport.onrender.com";  // ton API Render
+  </script>
+</head>
+<body>
+  <header>
+    <div class="brand">NovaPredict (beta)</div>
+    <div class="badge">Live</div>
+  </header>
+  <div class="wrap">
+    <div class="controls">
+      <input id="date" type="date" />
+      <select id="league">
+        <option value="">Toutes ligues</option>
+        <option value="L1">Ligue 1</option>
+      </select>
+      <button id="load">Charger</button>
+    </div>
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>Date</th><th>Ligue</th><th>Home</th><th>Away</th>
+          <th>p(Home)</th><th>p(Draw)</th><th>p(Away)</th>
+          <th>Over2.5</th><th>Value?</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <script>
+    const fmt = (x)=> x==null ? "-" : (Math.round(x*1000)/10)+"%";
+    const todayISO = new Date().toISOString().slice(0,10);
+    document.getElementById('date').value = todayISO;
+
+    async function load() {
+      const date = document.getElementById('date');
+      const league = document.getElementById('league');
+      const params = new URLSearchParams();
+      if (date.value) params.set("date", date.value);
+      if (league.value) params.set("league", league.value);
+      const url = `${window.API_BASE}/predictions?${params.toString()}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      const tb = document.querySelector("#tbl tbody");
+      tb.innerHTML = "";
+      for (const r of data) {
+        const mx = Math.max(r.p_home ?? 0, r.p_draw ?? 0, r.p_away ?? 0);
+        const value = mx > 0.5 ? '<span class="badge ok">Value</span>' : '<span class="badge warn">-</span>';
+        tb.insertAdjacentHTML("beforeend", `
+          <tr>
+            <td>${r.match_date}</td>
+            <td>${r.league_id ?? "-"}</td>
+            <td>${r.home}</td>
+            <td>${r.away}</td>
+            <td>${fmt(r.p_home)}</td>
+            <td>${fmt(r.p_draw)}</td>
+            <td>${fmt(r.p_away)}</td>
+            <td>${fmt(r.p_over25)}</td>
+            <td>${value}</td>
+          </tr>
+        `);
+      }
+    }
+    document.getElementById('load').onclick = load;
+    load();
+  </script>
+</body>
+</html>
