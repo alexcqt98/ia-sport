@@ -258,3 +258,134 @@ def admin_upsert(
         conn.close()
 
     return {"ok": True, "count": inserted, "date": d, "league": league_id}
+    # ============
+# BASELINE (cotes -> probabilités) + /admin/refresh
+# ============
+
+# Helpers sûrs (compatibles Python 3.11+ ; tu es en 3.13 sur Render)
+def _inv_safe(x: float | None) -> float | None:
+    if x is None:
+        return None
+    try:
+        x = float(x)
+        if x <= 0:
+            return None
+        return 1.0 / x
+    except Exception:
+        return None
+
+def _normalize_triple(a: float | None, b: float | None, c: float | None):
+    vals = [v for v in (a, b, c) if v is not None]
+    if not vals:
+        return None, None, None
+    s = sum(vals)
+    if s <= 0:
+        return None, None, None
+    def nz(v):
+        return (v / s) if v is not None else None
+    return nz(a), nz(b), nz(c)
+
+def _odds_to_probs(odds_home: float | None, odds_draw: float | None, odds_away: float | None):
+    ih = _inv_safe(odds_home)
+    idr = _inv_safe(odds_draw)
+    ia  = _inv_safe(odds_away)
+    return _normalize_triple(ih, idr, ia)
+
+def _odds_to_probs_over25(odds_over25: float | None, odds_under25: float | None):
+    io = _inv_safe(odds_over25)
+    iu = _inv_safe(odds_under25)
+    if io is None and iu is None:
+        return None, None
+    s = (io or 0.0) + (iu or 0.0)
+    if s <= 0:
+        return None, None
+    return (io or 0.0)/s, (iu or 0.0)/s
+
+
+@app.post("/admin/refresh", tags=["admin"])
+def admin_refresh(
+    payload: Dict[str, Any] = Body(...),
+    _ = Depends(require_admin),   # ne pas appeler require_admin()
+):
+    """
+    Reçoit des matchs + cotes, calcule des probabilités baseline et upsert en DB.
+
+    Body attendu :
+    {
+      "date": "YYYY-MM-DD",
+      "league_id": "L1",
+      "matches": [
+        {
+          "home": "PSG", "away": "OM", "status": "scheduled",
+          "odds": { "home": 1.75, "draw": 3.80, "away": 4.50, "over25": 1.85, "under25": 1.95 },
+          "version": "baseline-v1"
+        }
+      ]
+    }
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id", "L1")
+    matches = payload.get("matches", [])
+    inserted = 0
+
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # ligue présente
+            cur.execute("""
+                INSERT INTO leagues (id, name)
+                VALUES (%s, %s)
+                ON CONFLICT (id) DO NOTHING;
+            """, (league_id, league_id))
+
+            for m in matches:
+                home = m["home"]; away = m["away"]
+                status  = m.get("status", "scheduled")
+                version = m.get("version", "baseline-v1")
+
+                # 1) upsert match (uq_match)
+                cur.execute("""
+                    INSERT INTO matches (league_id, match_date, home_team, away_team, status)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT ON CONSTRAINT uq_match DO UPDATE
+                    SET status = EXCLUDED.status
+                    RETURNING id;
+                """, (league_id, d, home, away, status))
+                row = cur.fetchone()
+                if row:
+                    match_id = row[0] if not isinstance(row, dict) else row.get("id")
+                else:
+                    cur.execute("""
+                        SELECT id FROM matches
+                        WHERE league_id=%s AND match_date=%s AND home_team=%s AND away_team=%s
+                        LIMIT 1;
+                    """, (league_id, d, home, away))
+                    row = cur.fetchone()
+                    match_id = row[0] if row and not isinstance(row, dict) else (row.get("id") if row else None)
+
+                # 2) cotes -> probabilités
+                odds = (m.get("odds") or {})
+                p_home, p_draw, p_away = _odds_to_probs(
+                    odds.get("home"), odds.get("draw"), odds.get("away"))
+                p_over25, p_under25 = _odds_to_probs_over25(
+                    odds.get("over25"), odds.get("under25"))
+
+                # 3) upsert prediction (uq_pred: match_id, version)
+                cur.execute("""
+                    INSERT INTO predictions (match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT ON CONSTRAINT uq_pred DO UPDATE SET
+                        p_home=EXCLUDED.p_home,
+                        p_draw=EXCLUDED.p_draw,
+                        p_away=EXCLUDED.p_away,
+                        p_over25=EXCLUDED.p_over25,
+                        p_under25=EXCLUDED.p_under25,
+                        version=EXCLUDED.version;
+                """, (match_id, version, p_home, p_draw, p_away, p_over25, p_under25))
+
+                inserted += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "count": inserted, "date": d, "league": league_id}
+
