@@ -1,13 +1,14 @@
 import os, datetime
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Query, HTTPException, Header, Body
+
+from fastapi import FastAPI, Query, HTTPException, Header, Body, Depends
 from pydantic import BaseModel
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="NovaPredict API (beta)")
 
-# --- CORS (OK pour test, on restreindra plus tard) ---
+# --- CORS (permissif pour tests ; restreindre plus tard à ton domaine Vercel) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -20,23 +21,19 @@ app.add_middleware(
 DATABASE_URL = os.getenv("DATABASE_URL", "")  # ne bloque pas le boot
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
-# --- DB helpers ---
+# --- Helpers DB ---
 def db_conn():
-    """Retourne (connection, RealDictCursor) ou 503 si DATABASE_URL manquante."""
+    """
+    Retourne (connection, RealDictCursor) ou 503 si DATABASE_URL manquante.
+    psycopg2 est importé localement pour réduire les erreurs à l'import uvicorn.
+    """
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL absente (configure la variable sur Render).")
     import psycopg2
     from psycopg2.extras import RealDictCursor
     return psycopg2.connect(DATABASE_URL), RealDictCursor
 
-def _conn_raw():
-    """Connection simple (sans RealDictCursor) pour usages internes."""
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL manquante")
-    import psycopg2
-    return psycopg2.connect(DATABASE_URL)
-
-# --- Models ---
+# --- Pydantic models ---
 class Prediction(BaseModel):
     match_id: int
     league_id: Optional[str] = None
@@ -58,6 +55,7 @@ def health():
 
 @app.get("/")
 def root():
+    # Redirige vers la doc Swagger
     return RedirectResponse(url="/docs")
 
 # --- Public: predictions & metrics ---
@@ -99,10 +97,13 @@ def metrics():
     conn.close()
     return {"metrics": rows}
 
-# --- Seed (corrigé pour utiliser les contraintes) ---
+# --- Seed (exemple) ---
 @app.post("/seed")
 def seed():
-    """Seed d'un match et prédiction de test (date = aujourd'hui)."""
+    """
+    Seed d'un match et d'une prédiction de test (date = aujourd'hui).
+    Utilise les contraintes uq_match / uq_pred pour éviter les doublons.
+    """
     conn, RealDictCursor = db_conn()
     try:
         with conn.cursor() as cur:
@@ -115,7 +116,7 @@ def seed():
 
             match_date = datetime.date.today().isoformat()
 
-            # match : utiliser la contrainte uq_match
+            # match (uq_match)
             cur.execute("""
                 INSERT INTO matches (league_id, match_date, home_team, away_team, status)
                 VALUES ('L1', %s, 'PSG', 'OM', 'scheduled')
@@ -133,7 +134,7 @@ def seed():
                 """, (match_date,))
                 match_id = cur.fetchone()[0]
 
-            # prediction : utiliser la contrainte uq_pred (match_id, version)
+            # prediction (uq_pred)
             cur.execute("""
                 INSERT INTO predictions (match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
                 VALUES (%s, 'v0.1', 0.58, 0.24, 0.18, 0.62, 0.38)
@@ -155,7 +156,7 @@ def seed():
 # =========================
 
 def require_admin(x_admin_token: str = Header(default="")):
-    """Vérifie le header 'X-Admin-Token'."""
+    """Vérifie le header 'X-Admin-Token' pour les routes admin."""
     if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
@@ -164,7 +165,6 @@ def upsert_match(cur, league_id: str, d: str, home: str, away: str, status: str)
     """
     Insert/Update de match avec uq_match ; renvoie match_id.
     """
-    from psycopg2.extras import RealDictCursor as _R
     cur.execute("""
         INSERT INTO matches (league_id, match_date, home_team, away_team, status)
         VALUES (%s, %s, %s, %s, %s)
@@ -181,9 +181,7 @@ def upsert_match(cur, league_id: str, d: str, home: str, away: str, status: str)
         """, (league_id, d, home, away))
         row = cur.fetchone()
     # row peut être tuple (int) ou dict selon le cursor
-    if isinstance(row, dict):
-        return row.get("id")
-    return row[0]
+    return row["id"] if isinstance(row, dict) else row[0]
 
 def upsert_prediction(cur, match_id: int, probs: Dict[str, Any]):
     """
@@ -207,7 +205,10 @@ def upsert_prediction(cur, match_id: int, probs: Dict[str, Any]):
     ))
 
 @app.post("/admin/upsert", tags=["admin"])
-def admin_upsert(payload: Dict[str, Any] = Body(...), _=require_admin()):
+def admin_upsert(
+    payload: Dict[str, Any] = Body(...),
+    _ = Depends(require_admin),   # <-- la dépendance correcte (pas d'appel direct)
+):
     """
     Charge / met à jour des matchs + prédictions via JSON.
 
