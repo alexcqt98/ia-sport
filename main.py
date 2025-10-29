@@ -9,9 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="NovaPredict API (beta)")
 
 # --- CORS (permissif pour tests ; restreindre plus tard à ton domaine Vercel) ---
+allowed = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX", "")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=allowed if allowed else ["*"],
+    allow_origin_regex=origin_regex or None,   # <--- support regex
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
