@@ -82,3 +82,57 @@ def metrics():
         rows = cur.fetchall()
     conn.close()
     return {"metrics": rows}
+
+
+@app.post("/seed")
+def seed():
+    """Seed a sample match and prediction for testing."""
+    # connect to DB
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn.cursor() as cur:
+            # insert league
+            cur.execute("INSERT INTO leagues (id, name) VALUES ('L1','Ligue 1') ON CONFLICT (id) DO NOTHING;")
+            # prepare match date (today)
+            match_date = datetime.date.today().isoformat()
+            # insert or get match id
+            cur.execute(
+                """
+                INSERT INTO matches (league_id, match_date, home_team, away_team, status)
+                VALUES ('L1', %s, 'PSG', 'OM', 'scheduled')
+                ON CONFLICT (league_id, match_date, home_team, away_team) DO NOTHING
+                RETURNING id
+                """,
+                (match_date,)
+            )
+            res = cur.fetchone()
+            if res:
+                match_id = res[0]
+            else:
+                # fetch existing match id
+                cur.execute(
+                    """
+                    SELECT id FROM matches WHERE league_id='L1' AND match_date=%s AND home_team='PSG' AND away_team='OM'
+                    """,
+                    (match_date,),
+                )
+                match_id = cur.fetchone()[0]
+            # insert prediction (upsert)
+            cur.execute(
+                """
+                INSERT INTO predictions (match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
+                VALUES (%s, 'v0.1', 0.58, 0.24, 0.18, 0.62, 0.38)
+                ON CONFLICT (match_id) DO UPDATE SET
+                    version=EXCLUDED.version,
+                    p_home=EXCLUDED.p_home,
+                    p_draw=EXCLUDED.p_draw,
+                    p_away=EXCLUDED.p_away,
+                    p_over25=EXCLUDED.p_over25,
+                    p_under25=EXCLUDED.p_under25;
+                """,
+                (match_id,),
+            )
+        conn.commit()
+        return {"status": "seeded", "match_id": match_id}
+    finally:
+        conn.close()
