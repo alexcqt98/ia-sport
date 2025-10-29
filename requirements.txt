@@ -3,3 +3,7 @@ uvicorn[standard]
 psycopg2-binary
 pydantic
 python-dotenv
+requests
+pandas
+numpy
+scikit-learn
