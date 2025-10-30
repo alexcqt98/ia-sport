@@ -695,18 +695,87 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
 
 @app.get("/metrics/monthly")
 def metrics_monthly():
+    """
+    Agrège Brier Score et LogLoss par (mois, version) à partir des matches 'finished'.
+    Renvoie: [{month:'YYYY-MM-01', version:'elo-v1', n:12, brier:..., logloss:...}, ...]
+    """
+    import math
+
     conn, RealDictCursor = db_conn()
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Récupère tous les matchs terminés et leurs prédictions (toutes versions)
             cur.execute("""
-                select bucket_month, version, brier, logloss, n
-                from model_metrics
-                order by bucket_month desc, version asc
-                limit 200;
+                SELECT date_trunc('month', m.match_date)::date AS month,
+                       p.version,
+                       m.goals_home, m.goals_away,
+                       p.p_home, p.p_draw, p.p_away
+                FROM matches m
+                JOIN predictions p ON p.match_id = m.id
+                WHERE m.goals_home IS NOT NULL
+                  AND m.goals_away IS NOT NULL
+                  AND m.status = 'finished'
+                ORDER BY month ASC;
             """)
             rows = cur.fetchall()
+
+        # Rien à calculer ?
+        if not rows:
+            return {"items": []}
+
+        # agrégation (month, version) -> accumulateurs
+        agg = {}
+        for r in rows:
+            month = r["month"].isoformat() if hasattr(r["month"], "isoformat") else str(r["month"])
+            version = r["version"] or "unknown"
+
+            gh = int(r["goals_home"])
+            ga = int(r["goals_away"])
+
+            # outcome one-hot
+            if gh > ga:
+                y = (1.0, 0.0, 0.0)  # home
+                p_true = r["p_home"]
+            elif gh == ga:
+                y = (0.0, 1.0, 0.0)  # draw
+                p_true = r["p_draw"]
+            else:
+                y = (0.0, 0.0, 1.0)  # away
+                p_true = r["p_away"]
+
+            ph = r["p_home"] or 0.0
+            pd = r["p_draw"] or 0.0
+            pa = r["p_away"] or 0.0
+
+            # Brier multi-classes = moyenne des (p_k - y_k)^2 sur k∈{H,D,A}
+            brier = ((ph - y[0])**2 + (pd - y[1])**2 + (pa - y[2])**2) / 3.0
+
+            # LogLoss = -log(p_true) (clip pour éviter -inf)
+            eps = 1e-15
+            p_true_clip = max(min(p_true if p_true is not None else 0.0, 1.0 - eps), eps)
+            logloss = -math.log(p_true_clip)
+
+            key = (month, version)
+            if key not in agg:
+                agg[key] = {"n": 0, "s_brier": 0.0, "s_logloss": 0.0}
+            agg[key]["n"] += 1
+            agg[key]["s_brier"] += brier
+            agg[key]["s_logloss"] += logloss
+
+        # transforme en liste + moyennes
+        items = []
+        for (month, version), v in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
+            n = v["n"]
+            items.append({
+                "month": month,
+                "version": version,
+                "n": n,
+                "brier": v["s_brier"] / n,
+                "logloss": v["s_logloss"] / n
+            })
+
+        return {"items": items}
     finally:
         conn.close()
-      
-    return {"rows": rows}
+
 
