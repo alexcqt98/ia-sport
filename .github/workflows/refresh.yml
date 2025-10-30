@@ -3,7 +3,7 @@ name: Refresh Predictions
 on:
   schedule:
     - cron: "0 */3 * * *"   # toutes les 3 h (UTC)
-  workflow_dispatch:        # bouton "Run workflow"
+  workflow_dispatch:
 
 jobs:
   call-refresh:
@@ -53,7 +53,24 @@ jobs:
           echo "Built payload:"
           cat payload.json
 
-      - name: Call /admin/refresh
+      - name: Warm up API (/health) with retries
+        env:
+          API_BASE: https://ia-sport.onrender.com
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            echo "Ping /health (attempt $i)..."
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$API_BASE/health" || true)
+            echo "HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "API is warm."
+              exit 0
+            fi
+            sleep $((i*5))
+          done
+          echo "API did not warm up in time"; exit 1
+
+      - name: Call /admin/refresh with retries
         env:
           API_BASE: https://ia-sport.onrender.com
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
@@ -62,12 +79,24 @@ jobs:
           if [ -z "${ADMIN_TOKEN:-}" ]; then
             echo "Missing ADMIN_TOKEN secret"; exit 1
           fi
-          echo "Sending refresh for date ${{ steps.dateparis.outputs.date }} ..."
-          http_code=$(curl -sS -o response.json -w "%{http_code}" \
-            -X POST "$API_BASE/admin/refresh" \
-            -H "Content-Type: application/json" \
-            -H "X-Admin-Token: $ADMIN_TOKEN" \
-            --data-binary "@${{ steps.payload.outputs.file }}")
-          echo "HTTP $http_code"
-          cat response.json
-          test "$http_code" -ge 200 -a "$http_code" -lt 300
+
+          for i in 1 2 3 4 5; do
+            echo "POST /admin/refresh (attempt $i)..."
+            http_code=$(curl -sS -o response.json -w "%{http_code}" \
+              -X POST "$API_BASE/admin/refresh" \
+              -H "Content-Type: application/json" \
+              -H "X-Admin-Token: $ADMIN_TOKEN" \
+              --data-binary "@${{ steps.payload.outputs.file }}" || true)
+
+            echo "HTTP $http_code"
+            cat response.json || true
+
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+              echo "Success."
+              exit 0
+            fi
+            sleep $((i*8))
+          done
+
+          echo "Refresh failed after retries."
+          exit 1
