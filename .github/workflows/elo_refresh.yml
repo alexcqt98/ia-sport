@@ -1,0 +1,67 @@
+name: Refresh Predictions (Elo 7 jours)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"     # tous les jours à 06:00 UTC (~07:00 Paris)
+  workflow_dispatch:         # exécution manuelle possible
+
+jobs:
+  refresh-elo:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://ia-sport.onrender.com
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      MATCHES: ${{ secrets.UPSERT_MATCHES_JSON }}
+
+    steps:
+      - name: Compute Paris date
+        id: date
+        run: |
+          sudo timedatectl set-timezone Europe/Paris
+          echo "today=$(date +%F)" >> $GITHUB_OUTPUT
+          echo "Paris date = $(date +%F)"
+
+      - name: Warm up API (/health) with retries
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            echo "Ping /health (attempt $i)..."
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$API_BASE/health" || true)
+            echo "HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep $((i*5))
+          done
+          echo "API did not warm up in time"; exit 1
+
+      - name: Predict Elo for the next 7 days (J..J+6) with retries
+        run: |
+          set -euo pipefail
+          if [ -z "${ADMIN_TOKEN:-}" ]; then echo "Missing ADMIN_TOKEN"; exit 1; fi
+          if [ -z "${MATCHES:-}" ]; then
+            MATCHES='[
+              {"home":"PSG","away":"OM","status":"scheduled"},
+              {"home":"Lyon","away":"Monaco","status":"scheduled"},
+              {"home":"Lille","away":"Rennes","status":"scheduled"}
+            ]'
+          fi
+
+          for OFFSET in 0 1 2 3 4 5 6; do
+            DAY=$(date -d "${{ steps.date.outputs.today }} +${OFFSET} day" +%F)
+            echo ">>> Predicting Elo for ${DAY}"
+            BODY=$(jq -n --arg d "$DAY" --argjson matches "$MATCHES" \
+              '{date:$d, league_id:"L1", version:"elo-v1", matches:$matches}')
+
+            for i in 1 2 3; do
+              CODE=$(curl -s -o /tmp/out.json -w "%{http_code}" \
+                -X POST "$API_BASE/admin/predict_elo" \
+                -H "Content-Type: application/json" \
+                -H "X-Admin-Token: '"${ADMIN_TOKEN}"'" \
+                -d "$BODY")
+              echo "HTTP $CODE"
+              cat /tmp/out.json || true
+              [ "$CODE" = "200" ] && break
+              sleep 12
+            done
+
+            [ "$CODE" = "200" ] || (echo "Failed for day $DAY" && exit 1)
+          done
