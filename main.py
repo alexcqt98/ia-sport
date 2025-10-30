@@ -612,3 +612,100 @@ def admin_predict_ml(payload: Dict[str, Any] = Body(...), _=Depends(require_admi
         conn.close()
 
     return {"ok": True, "count": inserted, "version": version, "date": d, "league": league_id}
+    import math
+
+def _safe_log(x: float) -> float:
+    x = max(1e-12, min(1.0-1e-12, x if x is not None else 1e-12))
+    return math.log(x)
+
+def _brier(pw, pd, pl, w, d, l):
+    # Brier multi-classes : sum (p_i - y_i)^2
+    return (pw - w)**2 + (pd - d)**2 + (pl - l)**2
+
+@app.post("/admin/recompute_metrics", tags=["admin"])
+def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Recalcule Brier & LogLoss par (mois, version) à partir des matchs 'finished'
+    et des prédictions (toutes versions).
+    Body:
+      { "from": "2025-08-01", "to": "2025-12-31" }
+    """
+    d_from = payload.get("from") or "2025-01-01"
+    d_to   = payload.get("to")   or datetime.date.today().isoformat()
+
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # on récupère les (match, résultat, version & proba)
+            cur.execute("""
+                with results as (
+                  select id as match_id, match_date::date as d,
+                         case when goals_home>goals_away then 1 else 0 end as w,
+                         case when goals_home=goals_away then 1 else 0 end as drow,
+                         case when goals_home<goals_away then 1 else 0 end as l
+                  from matches
+                  where status='finished'
+                    and match_date between %s and %s
+                    and goals_home is not null and goals_away is not null
+                )
+                select r.d, date_trunc('month', r.d)::date as bucket_month,
+                       p.version, p.p_home, p.p_draw, p.p_away,
+                       r.w, r.drow, r.l
+                from results r
+                join predictions p on p.match_id = r.match_id
+            """, (d_from, d_to))
+            rows = cur.fetchall()
+
+            # agrégation
+            agg = {}
+            for t in rows:
+                bm = t["bucket_month"]; v = t["version"]
+                key = (bm, v)
+                pw, pd, pa = t["p_home"] or 0.0, t["p_draw"] or 0.0, t["p_away"] or 0.0
+                w, drow, l = t["w"], t["drow"], t["l"]
+                b = _brier(pw, pd, pa, w, drow, l)
+                # logloss "one-vs-all" sur issue gagnante (simplifié) :
+                # on choisit la proba de l'issue réalisée
+                p_obs = pw if w==1 else (pd if drow==1 else pa)
+                ll = -_safe_log(p_obs)
+                if key not in agg:
+                    agg[key] = {"sum_brier":0.0,"sum_ll":0.0,"n":0}
+                agg[key]["sum_brier"] += b
+                agg[key]["sum_ll"] += ll
+                agg[key]["n"] += 1
+
+            # upsert dans model_metrics
+            for (bm, v), s in agg.items():
+                if s["n"] == 0: continue
+                brier = s["sum_brier"]/s["n"]
+                logloss = s["sum_ll"]/s["n"]
+                cur.execute("""
+                    insert into model_metrics(bucket_month, version, brier, logloss, n)
+                    values (%s,%s,%s,%s,%s)
+                    on conflict (bucket_month, version) do update set
+                      brier = excluded.brier,
+                      logloss = excluded.logloss,
+                      n = excluded.n,
+                      created_at = now()
+                """, (bm, v, brier, logloss, s["n"]))
+    finally:
+        conn.close()
+
+    return {"ok": True, "from": d_from, "to": d_to, "buckets": len(agg)}
+
+@app.get("/metrics/monthly")
+def metrics_monthly():
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                select bucket_month, version, brier, logloss, n
+                from model_metrics
+                order by bucket_month desc, version asc
+                limit 200;
+            """)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {"rows": rows}
+
