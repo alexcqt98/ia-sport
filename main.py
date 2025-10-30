@@ -596,4 +596,141 @@ def admin_predict_elo(
         conn.close()
 
     return {"ok": True, "count": inserted, "date": d, "league": league_id, "version": version}
+from math import isfinite
+from statistics import mean
+
+def _fetch_last_n_results(cur, team: str, upto_date: str, n: int):
+    # Derniers n matchs de l’équipe (toutes compétitions) avant la date d
+    cur.execute("""
+        select match_date, home_team, away_team, goals_home, goals_away
+        from matches
+        where (home_team=%s or away_team=%s)
+          and match_date < %s
+          and goals_home is not null and goals_away is not null
+        order by match_date desc
+        limit %s;
+    """, (team, team, upto_date, n))
+    return cur.fetchall()
+
+def _points_for_row(team: str, row) -> int:
+    gh, ga = row["goals_home"], row["goals_away"]
+    if row["home_team"] == team:
+        if gh > ga: return 3
+        if gh == ga: return 1
+        return 0
+    else:
+        if ga > gh: return 3
+        if ga == gh: return 1
+        return 0
+
+def _rolling_stats(cur, team: str, d: str):
+    last10 = _fetch_last_n_results(cur, team, d, 10)
+    last5  = last10[:5]
+
+    games_10 = len(last10)
+    pts_10   = sum(_points_for_row(team, r) for r in last10)
+    gf_10    = sum(r["goals_home"] if r["home_team"]==team else r["goals_away"] for r in last10) if last10 else 0
+    ga_10    = sum(r["goals_away"] if r["home_team"]==team else r["goals_home"] for r in last10) if last10 else 0
+    form_5   = sum(_points_for_row(team, r) for r in last5)
+
+    # Elo courant
+    cur.execute("select rating from elo_ratings where team=%s;", (team,))
+    row = cur.fetchone()
+    elo = row["rating"] if row else 1500.0
+
+    return {
+        "games_10": games_10,
+        "pts_10": pts_10,
+        "goals_for_10": gf_10,
+        "goals_against_10": ga_10,
+        "form_points_5": form_5,
+        "elo": float(elo)
+    }
+
+@app.post("/admin/compute_features", tags=["admin"])
+def admin_compute_features(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Calcule et upsert les features pour la date donnée.
+    Body:
+    {
+      "date": "YYYY-MM-DD",
+      "league_id": "L1"
+    }
+    Prend tous les matches 'scheduled' de la date/ligue et crée/MAJ team_stats_daily + match_features.
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id")
+
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # sélection des matchs
+            cur.execute("""
+                select id, league_id, match_date, home_team, away_team
+                from matches
+                where match_date = %s
+                  and status = 'scheduled'
+                  and (%s is null or league_id = %s)
+                order by id;
+            """, (d, league_id, league_id))
+            rows = cur.fetchall()
+
+            upsert_count = 0
+            for r in rows:
+                mid = r["id"]; home = r["home_team"]; away = r["away_team"]
+                # stats quotidiennes snapshot
+                hs = _rolling_stats(cur, home, d)
+                as_ = _rolling_stats(cur, away, d)
+
+                # upsert team_stats_daily
+                cur.execute("""
+                    insert into team_stats_daily (team, d, games_10, pts_10, goals_for_10, goals_against_10, form_points_5, elo)
+                    values (%s,%s,%s,%s,%s,%s,%s,%s)
+                    on conflict (team, d) do update set
+                      games_10=excluded.games_10,
+                      pts_10=excluded.pts_10,
+                      goals_for_10=excluded.goals_for_10,
+                      goals_against_10=excluded.goals_against_10,
+                      form_points_5=excluded.form_points_5,
+                      elo=excluded.elo,
+                      updated_at=now();
+                """, (home, d, hs["games_10"], hs["pts_10"], hs["goals_for_10"], hs["goals_against_10"], hs["form_points_5"], hs["elo"]))
+                cur.execute("""
+                    insert into team_stats_daily (team, d, games_10, pts_10, goals_for_10, goals_against_10, form_points_5, elo)
+                    values (%s,%s,%s,%s,%s,%s,%s,%s)
+                    on conflict (team, d) do update set
+                      games_10=excluded.games_10,
+                      pts_10=excluded.pts_10,
+                      goals_for_10=excluded.goals_for_10,
+                      goals_against_10=excluded.goals_against_10,
+                      form_points_5=excluded.form_points_5,
+                      elo=excluded.elo,
+                      updated_at=now();
+                """, (away, d, as_["games_10"], as_["pts_10"], as_["goals_for_10"], as_["goals_against_10"], as_["form_points_5"], as_["elo"]))
+
+                elo_diff   = (hs["elo"] - as_["elo"])
+                form_diff5 = (hs["form_points_5"] - as_["form_points_5"])
+                gfga_diff10 = ((hs["goals_for_10"] - hs["goals_against_10"]) - (as_["goals_for_10"] - as_["goals_against_10"]))
+
+                # upsert match_features
+                cur.execute("""
+                    insert into match_features (match_id, d, league_id, home, away, elo_diff, form_diff_5, gfga_diff_10)
+                    values (%s,%s,%s,%s,%s,%s,%s,%s)
+                    on conflict (match_id) do update set
+                      d=excluded.d,
+                      league_id=excluded.league_id,
+                      home=excluded.home,
+                      away=excluded.away,
+                      elo_diff=excluded.elo_diff,
+                      form_diff_5=excluded.form_diff_5,
+                      gfga_diff_10=excluded.gfga_diff_10,
+                      updated_at=now();
+                """, (mid, d, r["league_id"], home, away, elo_diff, form_diff5, gfga_diff10))
+
+                upsert_count += 1
+
+    finally:
+        conn.close()
+
+    return {"ok": True, "features_upserted": upsert_count, "date": d, "league": league_id}
 
