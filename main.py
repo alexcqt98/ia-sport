@@ -392,4 +392,208 @@ def admin_refresh(
         conn.close()
 
     return {"ok": True, "count": inserted, "date": d, "league": league_id}
+# ---------- Elo helpers ----------
+ELO_K = float(os.getenv("ELO_K", "20"))
+ELO_HOME_ADV = float(os.getenv("ELO_HOME_ADV", "60"))  # avantage maison en points Elo
+
+def _get_team_rating(cur, team: str) -> float:
+    cur.execute("SELECT rating FROM elo_ratings WHERE team=%s", (team,))
+    row = cur.fetchone()
+    if row:
+        # row peut être dict (RealDictCursor) ou tuple
+        return row["rating"] if isinstance(row, dict) else row[0]
+    # crée si absent
+    cur.execute("INSERT INTO elo_ratings(team, rating) VALUES (%s, 1500) ON CONFLICT(team) DO NOTHING", (team,))
+    return 1500.0
+
+def _set_team_rating(cur, team: str, new_rating: float):
+    cur.execute("""
+        INSERT INTO elo_ratings(team, rating) VALUES (%s, %s)
+        ON CONFLICT(team) DO UPDATE SET rating=EXCLUDED.rating, updated_at=now()
+    """, (team, new_rating))
+
+def _elo_expected_score(ratingA: float, ratingB: float) -> float:
+    # proba(A bat B) dans le formalisme Elo
+    return 1.0 / (1.0 + 10.0 ** (-(ratingA - ratingB) / 400.0))
+
+def _elo_update_pair(cur, home: str, away: str, goals_home: int, goals_away: int):
+    # Charge ratings actuels
+    R_home = _get_team_rating(cur, home)
+    R_away = _get_team_rating(cur, away)
+    # Avantage maison
+    R_home_eff = R_home + ELO_HOME_ADV
+    R_away_eff = R_away
+
+    # Résultat en score Elo : win=1, draw=0.5, loss=0
+    if goals_home > goals_away:
+        S_home, S_away = 1.0, 0.0
+    elif goals_home < goals_away:
+        S_home, S_away = 0.0, 1.0
+    else:
+        S_home, S_away = 0.5, 0.5
+
+    # Expectancy
+    E_home = _elo_expected_score(R_home_eff, R_away_eff)
+    E_away = 1.0 - E_home
+
+    # Update
+    R_home_new = R_home + ELO_K * (S_home - E_home)
+    R_away_new = R_away + ELO_K * (S_away - E_away)
+
+    _set_team_rating(cur, home, R_home_new)
+    _set_team_rating(cur, away, R_away_new)
+
+def _elo_predict_probs(cur, home: str, away: str):
+    # proba Elo home/away ; draw approx augmenté quand ratings proches
+    R_home = _get_team_rating(cur, home) + ELO_HOME_ADV
+    R_away = _get_team_rating(cur, away)
+
+    p_home = _elo_expected_score(R_home, R_away)
+    p_away = _elo_expected_score(R_away, R_home)  # symétrique mais sans HFA
+    # proba de nul ~ plus forte quand écart Elo est faible
+    gap = abs((R_home - ELO_HOME_ADV) - R_away)
+    draw_base = 0.24  # base moyenne
+    draw_bonus = max(0.0, 0.12 - (gap / 800.0))  # bonus si équipes proches
+    p_draw = draw_base + draw_bonus
+    # Normalise le triplet
+    s = p_home + p_away + p_draw
+    if s > 0:
+        p_home, p_draw, p_away = p_home / s, p_draw / s, p_away / s
+    # Over/Under proxy très simple : plus l’écart Elo est grand, plus over25 ↑
+    over_bias = min(0.15, gap / 800.0)  # 0 à 0.15
+    p_over25 = 0.50 + over_bias
+    p_under25 = 1.0 - p_over25
+    return p_home, p_draw, p_away, p_over25, p_under25
+@app.post("/admin/record_results", tags=["admin"])
+def admin_record_results(
+    payload: Dict[str, Any] = Body(...),
+    _ = Depends(require_admin),
+):
+    """
+    Enregistre une liste de résultats et met à jour les Elo.
+    Body:
+    {
+      "results": [
+        {"date":"YYYY-MM-DD","league_id":"L1","home":"PSG","away":"OM","goals_home":4,"goals_away":0},
+        ...
+      ]
+    }
+    """
+    results = payload.get("results", [])
+    if not results:
+        raise HTTPException(400, "results vide")
+
+    conn, RealDictCursor = db_conn()
+    updated = 0
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            for r in results:
+                d = r["date"]; league_id = r.get("league_id", "L1")
+                home = r["home"]; away = r["away"]
+                gh = int(r["goals_home"]); ga = int(r["goals_away"])
+
+                # s'assure ligue
+                cur.execute("""
+                    INSERT INTO leagues(id, name) VALUES(%s,%s)
+                    ON CONFLICT(id) DO NOTHING
+                """, (league_id, league_id))
+
+                # upsert match (et set score + status=finished)
+                cur.execute("""
+                    INSERT INTO matches(league_id, match_date, home_team, away_team, status, goals_home, goals_away)
+                    VALUES (%s, %s, %s, %s, 'finished', %s, %s)
+                    ON CONFLICT ON CONSTRAINT uq_match DO UPDATE
+                    SET status='finished', goals_home=EXCLUDED.goals_home, goals_away=EXCLUDED.goals_away
+                    RETURNING id;
+                """, (league_id, d, home, away, gh, ga))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        SELECT id FROM matches
+                        WHERE league_id=%s AND match_date=%s AND home_team=%s AND away_team=%s
+                        LIMIT 1
+                    """, (league_id, d, home, away))
+                    row = cur.fetchone()
+                match_id = row["id"] if isinstance(row, dict) else row[0]
+
+                # update Elo
+                _elo_update_pair(cur, home, away, gh, ga)
+                updated += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "updated": updated}
+@app.post("/admin/predict_elo", tags=["admin"])
+def admin_predict_elo(
+    payload: Dict[str, Any] = Body(...),
+    _ = Depends(require_admin),
+):
+    """
+    Génère des prédictions Elo pour des matchs à venir et les upsert.
+    Body:
+    {
+      "date": "YYYY-MM-DD",
+      "league_id": "L1",
+      "matches": [
+        {"home":"PSG","away":"OM","status":"scheduled"}
+      ],
+      "version": "elo-v1"
+    }
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id", "L1")
+    version = payload.get("version", "elo-v1")
+    matches = payload.get("matches", [])
+    if not matches:
+        raise HTTPException(400, "matches vide")
+
+    conn, RealDictCursor = db_conn()
+    inserted = 0
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("INSERT INTO leagues(id, name) VALUES (%s,%s) ON CONFLICT(id) DO NOTHING",
+                        (league_id, league_id))
+
+            for m in matches:
+                home = m["home"]; away = m["away"]
+                status = m.get("status", "scheduled")
+
+                # upsert match
+                cur.execute("""
+                    INSERT INTO matches(league_id, match_date, home_team, away_team, status)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT ON CONSTRAINT uq_match DO UPDATE
+                    SET status=EXCLUDED.status
+                    RETURNING id;
+                """, (league_id, d, home, away, status))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        SELECT id FROM matches
+                        WHERE league_id=%s AND match_date=%s AND home_team=%s AND away_team=%s
+                        LIMIT 1
+                    """, (league_id, d, home, away))
+                    row = cur.fetchone()
+                match_id = row["id"] if isinstance(row, dict) else row[0]
+
+                # proba via Elo
+                p_home, p_draw, p_away, p_over25, p_under25 = _elo_predict_probs(cur, home, away)
+
+                # upsert predictions
+                cur.execute("""
+                    INSERT INTO predictions(match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT ON CONSTRAINT uq_pred DO UPDATE SET
+                      p_home=EXCLUDED.p_home,
+                      p_draw=EXCLUDED.p_draw,
+                      p_away=EXCLUDED.p_away,
+                      p_over25=EXCLUDED.p_over25,
+                      p_under25=EXCLUDED.p_under25,
+                      version=EXCLUDED.version
+                """, (match_id, version, p_home, p_draw, p_away, p_over25, p_under25))
+                inserted += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "count": inserted, "date": d, "league": league_id, "version": version}
 
