@@ -1,0 +1,88 @@
+name: Daily ML pipeline (Paris)
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # tous les jours 06:00 UTC (~07:00 Paris)
+  workflow_dispatch:
+
+jobs:
+  daily-ml:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://ia-sport.onrender.com
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+    steps:
+      - name: Compute Paris date
+        id: paris
+        run: |
+          sudo timedatectl set-timezone Europe/Paris
+          echo "date=$(date +%F)" >> $GITHUB_OUTPUT
+          echo "Paris date = $(date +%F)"
+
+      - name: Warm up API (/health)
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "$API_BASE/health" || true)
+            echo "HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep $((i*5))
+          done
+          echo "API did not warm up in time"; exit 1
+
+      # 1) (option) MAJ Elo si tu as des résultats du jour J-1 à injecter
+      # - name: Record results (optional)
+      #   env:
+      #     RESULTS_JSON: ${{ secrets.RESULTS_JSON }}   # ex: payload de résultats J-1
+      #   run: |
+      #     set -euo pipefail
+      #     [ -z "${RESULTS_JSON:-}" ] && { echo "No RESULTS_JSON, skipping"; exit 0; }
+      #     curl -sS -X POST "$API_BASE/admin/record_results" \
+      #       -H "Content-Type: application/json" \
+      #       -H "X-Admin-Token: ${ADMIN_TOKEN}" \
+      #       -d "${RESULTS_JSON}"
+
+      # 2) Compute features pour la date du jour (Paris)
+      - name: Compute features
+        run: |
+          set -euo pipefail
+          BODY=$(jq -n --arg d "${{ steps.paris.outputs.date }}" --arg l "L1" \
+            '{date:$d, league_id:$l}')
+          curl -sS -X POST "$API_BASE/admin/build_features" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Token: ${ADMIN_TOKEN}" \
+            -d "$BODY"
+
+      # 3) Prédictions Elo (mêmes matchs que ta journée)
+      - name: Predict Elo
+        env:
+          MATCHES: ${{ secrets.UPSERT_MATCHES_JSON }}  # sinon on met un fallback
+        run: |
+          set -euo pipefail
+          if [ -z "${MATCHES:-}" ]; then
+            MATCHES='[
+              {"home":"PSG","away":"OM","status":"scheduled"},
+              {"home":"Lyon","away":"Monaco","status":"scheduled"},
+              {"home":"Lille","away":"Rennes","status":"scheduled"}
+            ]'
+          fi
+          BODY=$(jq -n --arg d "${{ steps.paris.outputs.date }}" \
+                      --arg l "L1" \
+                      --arg v "elo-v1" \
+                      --argjson matches "$MATCHES" \
+                '{date:$d, league_id:$l, version:$v, matches:$matches}')
+          curl -sS -X POST "$API_BASE/admin/predict_elo" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Token: ${ADMIN_TOKEN}" \
+            -d "$BODY"
+
+      # 4) Prédictions ML (utilise les features calculées)
+      - name: Predict ML
+        run: |
+          set -euo pipefail
+          BODY=$(jq -n --arg d "${{ steps.paris.outputs.date }}" --arg l "L1" --arg v "ml-v1" \
+                '{date:$d, league_id:$l, version:$v}')
+          curl -sS -X POST "$API_BASE/admin/predict_ml" \
+            -H "Content-Type: application/json" \
+            -H "X-Admin-Token: ${ADMIN_TOKEN}" \
+            -d "$BODY"
