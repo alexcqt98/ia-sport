@@ -2,8 +2,8 @@ name: Refresh Predictions
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # toutes les 3h (GitHub Actions tourne en UTC)
-  workflow_dispatch:        # bouton "Run workflow" manuel
+    - cron: "0 */3 * * *"   # toutes les 3 h (UTC)
+  workflow_dispatch:        # bouton "Run workflow"
 
 jobs:
   call-refresh:
@@ -13,18 +13,16 @@ jobs:
       - name: Compute Paris date (YYYY-MM-DD)
         id: dateparis
         run: |
-          # calcule la date à Paris (Europe/Paris), même si le runner est en UTC
           PARIS_DATE=$(TZ="Europe/Paris" date +%F)
           echo "date=$PARIS_DATE" >> $GITHUB_OUTPUT
+          echo "Paris date = $PARIS_DATE"
 
-      - name: Build payload JSON
+      - name: Build payload.json
         id: payload
         run: |
-          # Exemple simple sur Ligue 1 (L1) avec 3 matchs.
-          # A remplacer par des matchs du jour que tu veux.
-          read -r -d '' JSON << 'EOF'
+          cat > payload.json <<EOF
           {
-            "date": "__DATE__",
+            "date": "${{ steps.dateparis.outputs.date }}",
             "league_id": "L1",
             "matches": [
               {
@@ -51,28 +49,25 @@ jobs:
             ]
           }
           EOF
-
-          JSON="${JSON/__DATE__/${{ steps.dateparis.outputs.date }}}"
-          echo "$JSON" > payload.json
           echo "file=payload.json" >> $GITHUB_OUTPUT
+          echo "Built payload:"
+          cat payload.json
 
       - name: Call /admin/refresh
         env:
           API_BASE: https://ia-sport.onrender.com
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          set -e
-          test -n "$ADMIN_TOKEN"
-          echo "Sending refresh for date ${{ steps.dateparis.outputs.date }}..."
+          set -euo pipefail
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "Missing ADMIN_TOKEN secret"; exit 1
+          fi
+          echo "Sending refresh for date ${{ steps.dateparis.outputs.date }} ..."
           http_code=$(curl -sS -o response.json -w "%{http_code}" \
             -X POST "$API_BASE/admin/refresh" \
             -H "Content-Type: application/json" \
             -H "X-Admin-Token: $ADMIN_TOKEN" \
             --data-binary "@${{ steps.payload.outputs.file }}")
-
           echo "HTTP $http_code"
           cat response.json
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "Refresh failed with HTTP $http_code"
-            exit 1
-          fi
+          test "$http_code" -ge 200 -a "$http_code" -lt 300
