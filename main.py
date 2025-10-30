@@ -733,4 +733,81 @@ def admin_compute_features(payload: Dict[str, Any] = Body(...), _=Depends(requir
         conn.close()
 
     return {"ok": True, "features_upserted": upsert_count, "date": d, "league": league_id}
+    import math
+import numpy as np
+from typing import Tuple
+
+def _sigmoid(x): 
+    try:
+        return 1.0 / (1.0 + math.exp(-x))
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+
+def _softmax3(a,b,c):
+    mx = max(a,b,c)
+    ea, eb, ec = math.exp(a-mx), math.exp(b-mx), math.exp(c-mx)
+    s = ea+eb+ec
+    return ea/s, eb/s, ec/s
+
+@app.post("/admin/predict_ml", tags=["admin"])
+def admin_predict_ml(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Produit des proba 'ml-v1' depuis les features (rule-based/linear) et upsert.
+    Body:
+    { "date":"YYYY-MM-DD", "league_id":"L1", "version":"ml-v1" }
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id")
+    version = payload.get("version", "ml-v1")
+
+    conn, RealDictCursor = db_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # récup matches + features
+            cur.execute("""
+                select m.id, m.league_id, m.match_date, m.home_team, m.away_team,
+                       f.elo_diff, f.form_diff_5, f.gfga_diff_10
+                from matches m
+                join match_features f on f.match_id = m.id
+                where m.match_date = %s
+                  and m.status = 'scheduled'
+                  and (%s is null or m.league_id = %s)
+                order by m.id;
+            """, (d, league_id, league_id))
+            rows = cur.fetchall()
+
+            inserted = 0
+            for r in rows:
+                # petit modèle linéaire fait main (tu pourras remplacer par sklearn)
+                # logit home ~ a*elo_diff + b*form_diff + c*gfga_diff
+                z_home =  0.0025*(r["elo_diff"] or 0) + 0.08*(r["form_diff_5"] or 0) + 0.02*(r["gfga_diff_10"] or 0)
+                z_away = -z_home
+                z_draw = -0.5*abs(z_home)  # le nul plus probable quand forces proches
+
+                p_home, p_draw, p_away = _softmax3(z_home, z_draw, z_away)
+
+                # Over/Under heuristique à partir de gf/ga récents
+                mu = 2.4 + 0.02*(r["gfga_diff_10"] or 0)  # moyenne buts brute
+                # map mu → proba Over2.5 ~ sigmoïde
+                p_over25 = _sigmoid(1.2*(mu - 2.5))
+                p_under25 = 1.0 - p_over25
+
+                # upsert prediction
+                cur.execute("""
+                    insert into predictions (match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
+                    values (%s,%s,%s,%s,%s,%s,%s)
+                    on conflict on constraint uq_pred do update set
+                      p_home=excluded.p_home,
+                      p_draw=excluded.p_draw,
+                      p_away=excluded.p_away,
+                      p_over25=excluded.p_over25,
+                      p_under25=excluded.p_under25,
+                      version=excluded.version;
+                """, (r["id"], version, p_home, p_draw, p_away, p_over25, p_under25))
+                inserted += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "count": inserted, "version": version, "date": d, "league": league_id}
+
 
