@@ -778,4 +778,54 @@ def metrics_monthly():
     finally:
         conn.close()
 
+@app.post("/admin/backfill_predictions", tags=["admin"])
+def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Crée/MAJ des prédictions 'elo-v1' pour tous les matches FINISHED
+    entre 'from' et 'to' (inclus), afin que /metrics/monthly ait de la matière.
+    Body:
+      { "from": "2025-10-01", "to": "2025-10-31", "version": "elo-v1" }
+    """
+    d_from = payload.get("from") or "2025-01-01"
+    d_to   = payload.get("to")   or datetime.date.today().isoformat()
+    version = payload.get("version", "elo-v1")
 
+    conn, RealDictCursor = db_conn()
+    created = 0
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Récupère tous les matches terminés sur la période
+            cur.execute("""
+                SELECT id, league_id, match_date, home_team, away_team
+                FROM matches
+                WHERE status='finished'
+                  AND match_date BETWEEN %s AND %s
+                ORDER BY match_date, id;
+            """, (d_from, d_to))
+            rows = cur.fetchall()
+
+            for m in rows:
+                mid   = m["id"]
+                home  = m["home_team"]
+                away  = m["away_team"]
+
+                # Probas via Elo existant
+                p_home, p_draw, p_away, p_over25, p_under25 = _elo_predict_probs(cur, home, away)
+
+                # Upsert prédiction (uq_pred: match_id, version)
+                cur.execute("""
+                    INSERT INTO predictions(match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT ON CONSTRAINT uq_pred DO UPDATE SET
+                      p_home=EXCLUDED.p_home,
+                      p_draw=EXCLUDED.p_draw,
+                      p_away=EXCLUDED.p_away,
+                      p_over25=EXCLUDED.p_over25,
+                      p_under25=EXCLUDED.p_under25,
+                      version=EXCLUDED.version;
+                """, (mid, version, p_home, p_draw, p_away, p_over25, p_under25))
+                created += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "created_or_updated": created, "from": d_from, "to": d_to, "version": version}
