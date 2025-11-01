@@ -7,35 +7,32 @@
   <style>
     :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
     body { margin: 0; background:#0b0f14; color:#e6edf3; }
-    header { padding: 18px 24px; border-bottom:1px solid #1f2937; display:flex; gap:12px; align-items:center;}
+    header { padding: 24px; border-bottom:1px solid #1f2937; display:flex; justify-content:space-between; align-items:center;}
     .brand { font-weight:700; letter-spacing:.3px; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 24px; }
-    .controls { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; align-items:center; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .controls { display:flex; gap:12px; margin-bottom:16px; flex-wrap: wrap; }
     input, select, button {
-      background:#0f1720; color:#e6edf3; border:1px solid #223042; border-radius:10px; padding:9px 12px;
+      background:#0f1720; color:#e6edf3; border:1px solid #223042; border-radius:10px; padding:10px 12px;
     }
     table { width:100%; border-collapse: collapse; overflow: hidden; border-radius: 12px; }
     th, td { padding:12px; border-bottom:1px solid #1f2937; text-align:left; }
-    th { background: #101826; position: sticky; top: 0; }
+    th { background: #101826; }
     .badge { font-size:12px; padding:4px 8px; border-radius:8px; border:1px solid #2f4a66; white-space:nowrap; }
     .ok { color:#22c55e; border-color:#14532d; }
     .warn { color:#f59e0b; border-color:#7c4a03; }
-    .muted { color:#94a3b8; }
-    .link { color:#60a5fa; text-decoration: none; }
-    .link:hover { text-decoration: underline; }
+    .danger { color:#ef4444; border-color:#7f1d1d; }
+    .muted { color:#9aa4af; }
+    .pill { background:#0f1720; border:1px solid #223042; border-radius:999px; padding:6px 10px; font-size:12px;}
   </style>
   <script>
-    // ⚠️ Mets ton domaine API si besoin
     window.API_BASE = "https://ia-sport.onrender.com";
   </script>
 </head>
 <body>
   <header>
-    <div class="brand">NovaPredict</div>
-    <a class="link" href="./admin.html">Admin (metrics)</a>
-    <span class="badge">Front v2</span>
+    <div class="brand">NovaPredict (beta)</div>
+    <div class="badge">Front v2</div>
   </header>
-
   <div class="wrap">
     <div class="controls">
       <input id="date" type="date" />
@@ -44,115 +41,120 @@
         <option value="L1">Ligue 1</option>
       </select>
       <select id="version">
-        <option value="best">Meilleur modèle</option>
-        <option value="baseline-v1">baseline-v1</option>
-        <option value="elo-v1">elo-v1</option>
+        <option value="auto">Version : auto (ml > elo > baseline)</option>
         <option value="ml-v1">ml-v1</option>
+        <option value="elo-v1">elo-v1</option>
+        <option value="baseline-v1">baseline-v1</option>
       </select>
-      <label class="muted"><input id="showDisagree" type="checkbox" /> Badge “Désaccord”</label>
       <button id="load">Charger</button>
+      <span id="meta" class="pill muted"></span>
     </div>
 
     <table id="tbl">
       <thead>
         <tr>
           <th>Date</th><th>Ligue</th><th>Match</th>
-          <th>p(Home)</th><th>p(Draw)</th><th>p(Away)</th>
-          <th>Over2.5</th><th>Modèle</th><th>Signal</th>
+          <th>p(1)</th><th>p(N)</th><th>p(2)</th>
+          <th>Over2.5</th><th>Pick</th><th>Modèles</th>
         </tr>
       </thead>
       <tbody></tbody>
     </table>
-    <p class="muted" id="hint" style="margin-top:10px;"></p>
   </div>
 
   <script>
-    const fmt = (x)=> x==null ? "-" : (Math.round(x*1000)/10)+"%";
+    const fmt = (x)=> x==null ? "-" : (Math.round(Number(x)*1000)/10)+"%";
     const todayISO = new Date().toISOString().slice(0,10);
     date.value = todayISO;
 
-    // regroupe les lignes par match (date+league+teams)
-    function groupByMatch(rows) {
-      const key = (r)=> [r.match_date, r.league_id || "", r.home, r.away].join("|");
-      const map = new Map();
-      for (const r of rows) {
-        const k = key(r);
-        if (!map.has(k)) map.set(k, []);
-        map.get(k).push(r);
+    function groupByMatch(rows){
+      // Regroupe par match_id (ou fallback par clé home|away|date)
+      const g = new Map();
+      for (const r of rows){
+        const key = r.match_id ?? `${r.match_date}|${r.home}|${r.away}`;
+        if(!g.has(key)) g.set(key, {meta: {date:r.match_date, league:r.league_id, home:r.home, away:r.away}, versions:{}});
+        g.get(key).versions[r.version || "unknown"] = r;
       }
-      return [...map.entries()].map(([k, arr]) => ({ key:k, versions: arr }));
+      return [...g.values()];
     }
 
-    function pickBest(versions) {
-      // “best” = max p_home/p_draw/p_away max (confiance)
-      let best = versions[0], bestScore = -1;
-      for (const v of versions) {
-        const s = Math.max(v.p_home ?? 0, v.p_draw ?? 0, v.p_away ?? 0);
-        if (s > bestScore) { bestScore = s; best = v; }
+    function pickVersion(vmap, desired){
+      if (desired && desired !== "auto" && vmap[desired]) return {name:desired, row:vmap[desired]};
+      if (vmap["ml-v1"]) return {name:"ml-v1", row:vmap["ml-v1"]};
+      if (vmap["elo-v1"]) return {name:"elo-v1", row:vmap["elo-v1"]};
+      if (vmap["baseline-v1"]) return {name:"baseline-v1", row:vmap["baseline-v1"]};
+      // first available
+      const k = Object.keys(vmap)[0];
+      return k ? {name:k, row:vmap[k]} : {name:"-", row:null};
+    }
+
+    function issueFromRow(r){
+      if(!r) return "-";
+      const arr = [
+        {k:"1", v:Number(r.p_home ?? 0)},
+        {k:"N", v:Number(r.p_draw ?? 0)},
+        {k:"2", v:Number(r.p_away ?? 0)},
+      ];
+      arr.sort((a,b)=> b.v-a.v);
+      return arr[0].k;
+    }
+
+    function disagreement(vmap){
+      // Vrai si au moins deux versions ne donnent pas la même issue
+      const picks = [];
+      for (const [name,row] of Object.entries(vmap)){
+        if (!row) continue;
+        picks.push(issueFromRow(row));
       }
-      return best;
+      const set = new Set(picks);
+      return set.size > 1;
     }
 
-    function disagreementBadge(versions) {
-      // désaccord si delta max sur p_home (ou outcome max) > 0.12
-      if (versions.length < 2) return "";
-      const ph = versions.map(v => v.p_home ?? 0);
-      const pd = versions.map(v => v.p_draw ?? 0);
-      const pa = versions.map(v => v.p_away ?? 0);
-      const spread = Math.max(
-        Math.max(...ph) - Math.min(...ph),
-        Math.max(...pd) - Math.min(...pd),
-        Math.max(...pa) - Math.min(...pa),
-      );
-      return spread >= 0.12 ? '<span class="badge warn">Désaccord</span>' : '';
-    }
-
-    async function load() {
+    async function load(){
       const params = new URLSearchParams();
       if (date.value) params.set("date", date.value);
       if (league.value) params.set("league", league.value);
       const url = `${window.API_BASE}/predictions?${params.toString()}`;
+      const t0 = performance.now();
       const res = await fetch(url);
       const data = await res.json();
+      const ms = Math.round(performance.now()-t0);
 
       const groups = groupByMatch(data);
       const tb = document.querySelector("#tbl tbody");
       tb.innerHTML = "";
 
-      let count = 0;
-      for (const g of groups) {
-        const versions = g.versions;
-        let rowChoice;
-        const vSel = version.value;
-        if (vSel === "best") rowChoice = pickBest(versions);
-        else rowChoice = versions.find(v => v.version === vSel) || versions[0];
+      for (const g of groups){
+        const {meta, versions} = g;
+        const chosen = pickVersion(versions, version.value);
+        const r = chosen.row;
+        const pick = issueFromRow(r);
 
-        const dis = showDisagree.checked ? disagreementBadge(versions) : "";
-        const value = Math.max(rowChoice.p_home ?? 0, rowChoice.p_draw ?? 0, rowChoice.p_away ?? 0) > 0.5
-          ? '<span class="badge ok">Value</span>' : '<span class="badge muted">–</span>';
+        const badge = disagreement(versions)
+          ? '<span class="badge danger">Désaccord</span>'
+          : '<span class="badge ok">OK</span>';
 
         tb.insertAdjacentHTML("beforeend", `
           <tr>
-            <td>${rowChoice.match_date}</td>
-            <td>${rowChoice.league_id ?? "-"}</td>
-            <td>${rowChoice.home} — ${rowChoice.away}</td>
-            <td>${fmt(rowChoice.p_home)}</td>
-            <td>${fmt(rowChoice.p_draw)}</td>
-            <td>${fmt(rowChoice.p_away)}</td>
-            <td>${fmt(rowChoice.p_over25)}</td>
-            <td>${rowChoice.version}</td>
-            <td>${dis || value}</td>
+            <td>${meta.date}</td>
+            <td>${meta.league ?? "-"}</td>
+            <td>${meta.home} — ${meta.away} <span class="muted">(${chosen.name})</span></td>
+            <td>${fmt(r?.p_home)}</td>
+            <td>${fmt(r?.p_draw)}</td>
+            <td>${fmt(r?.p_away)}</td>
+            <td>${fmt(r?.p_over25)}</td>
+            <td><span class="badge">${pick}</span></td>
+            <td>${badge}</td>
           </tr>
         `);
-        count++;
       }
-      document.getElementById('hint').textContent =
-        `${count} matchs affichés — sélection "${version.value}".`;
+
+      const cnt = groups.length;
+      meta.textContent = `${cnt} matchs • ${ms} ms • ${new Date().toLocaleTimeString()}`;
     }
 
     document.getElementById('load').onclick = load;
     document.getElementById('version').onchange = load;
-    document.getElementById('showDisagree').onchange = load;
     load();
   </script>
 </body>
