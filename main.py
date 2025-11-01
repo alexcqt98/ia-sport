@@ -700,11 +700,18 @@ def metrics_monthly():
     Renvoie: [{month:'YYYY-MM-01', version:'elo-v1', n:12, brier:..., logloss:...}, ...]
     """
     import math
+    from decimal import Decimal
+
+    def to_float(x):
+        if x is None:
+            return 0.0
+        if isinstance(x, Decimal):
+            return float(x)
+        return float(x)
 
     conn, RealDictCursor = db_conn()
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Récupère tous les matchs terminés et leurs prédictions (toutes versions)
             cur.execute("""
                 SELECT date_trunc('month', m.match_date)::date AS month,
                        p.version,
@@ -719,50 +726,39 @@ def metrics_monthly():
             """)
             rows = cur.fetchall()
 
-        # Rien à calculer ?
         if not rows:
             return {"items": []}
 
-        # agrégation (month, version) -> accumulateurs
         agg = {}
         for r in rows:
             month = r["month"].isoformat() if hasattr(r["month"], "isoformat") else str(r["month"])
-            version = r["version"] or "unknown"
+            version = (r["version"] or "unknown")
 
-            gh = int(r["goals_home"])
-            ga = int(r["goals_away"])
+            gh = int(r["goals_home"]); ga = int(r["goals_away"])
+            if   gh > ga: y = (1.0, 0.0, 0.0); p_true = r["p_home"]
+            elif gh == ga: y = (0.0, 1.0, 0.0); p_true = r["p_draw"]
+            else:          y = (0.0, 0.0, 1.0); p_true = r["p_away"]
 
-            # outcome one-hot
-            if gh > ga:
-                y = (1.0, 0.0, 0.0)  # home
-                p_true = r["p_home"]
-            elif gh == ga:
-                y = (0.0, 1.0, 0.0)  # draw
-                p_true = r["p_draw"]
-            else:
-                y = (0.0, 0.0, 1.0)  # away
-                p_true = r["p_away"]
+            ph = to_float(r["p_home"])
+            pd = to_float(r["p_draw"])
+            pa = to_float(r["p_away"])
 
-            ph = r["p_home"] or 0.0
-            pd = r["p_draw"] or 0.0
-            pa = r["p_away"] or 0.0
-
-            # Brier multi-classes = moyenne des (p_k - y_k)^2 sur k∈{H,D,A}
+            # Brier multi-classes
             brier = ((ph - y[0])**2 + (pd - y[1])**2 + (pa - y[2])**2) / 3.0
 
-            # LogLoss = -log(p_true) (clip pour éviter -inf)
+            # LogLoss = -log(p_true clip)
             eps = 1e-15
-            p_true_clip = max(min(p_true if p_true is not None else 0.0, 1.0 - eps), eps)
+            p_true_val = to_float(p_true)
+            p_true_clip = max(min(p_true_val, 1.0 - eps), eps)
             logloss = -math.log(p_true_clip)
 
             key = (month, version)
             if key not in agg:
                 agg[key] = {"n": 0, "s_brier": 0.0, "s_logloss": 0.0}
-            agg[key]["n"] += 1
+            agg[key]["n"]       += 1
             agg[key]["s_brier"] += brier
             agg[key]["s_logloss"] += logloss
 
-        # transforme en liste + moyennes
         items = []
         for (month, version), v in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
             n = v["n"]
@@ -773,10 +769,10 @@ def metrics_monthly():
                 "brier": v["s_brier"] / n,
                 "logloss": v["s_logloss"] / n
             })
-
         return {"items": items}
     finally:
         conn.close()
+
 
 @app.post("/admin/backfill_predictions", tags=["admin"])
 def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
