@@ -38,9 +38,14 @@ def db_conn():
     import psycopg2
     from psycopg2.extras import RealDictCursor
     return psycopg2.connect(DATABASE_URL), RealDictCursor
-  def _ensure_team(cur, alias: str) -> int:
+
+# ========================
+# Team alias helpers (facultatif pour ingestion)
+# ========================
+def _ensure_team(cur, alias: str) -> int:
     """
     Mappe un alias d’équipe -> team_id (crée si inconnu).
+    Requiert les tables: teams(id serial pk, name text unique), team_aliases(alias text pk, team_id fk).
     """
     cur.execute("select team_id from team_aliases where alias=%s", (alias,))
     row = cur.fetchone()
@@ -62,7 +67,8 @@ def _resolve_team_name(cur, alias: str) -> str:
     Retourne le nom canonique (teams.name) à partir d’un alias, sinon l’alias.
     """
     cur.execute("""
-        select t.name from team_aliases a
+        select t.name
+        from team_aliases a
         join teams t on t.id=a.team_id
         where a.alias=%s
     """, (alias,))
@@ -70,8 +76,6 @@ def _resolve_team_name(cur, alias: str) -> str:
     if not row:
         return alias
     return row["name"] if isinstance(row, dict) else row[0]
-
-
 
 # ========================
 # Schemas publics
@@ -157,7 +161,8 @@ def seed():
                 returning id;
             """, (match_date,))
             row = cur.fetchone()
-            if row: match_id = row[0]
+            if row:
+                match_id = row[0]
             else:
                 cur.execute("""
                     select id from matches
@@ -228,46 +233,28 @@ def upsert_prediction(cur, match_id: int, probs: Dict[str, Any]):
     ))
 
 # =========================
-# /admin/upsert (manuel)
-# =========================
-@app.post("/admin/upsert", tags=["admin"])
-def admin_upsert(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin)):
-    d = payload["date"]
-    league_id = payload.get("league_id", "L1")
-    matches = payload.get("matches", [])
-    inserted = 0
-
-    conn, RealDictCursor = db_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("insert into leagues(id,name) values(%s,%s) on conflict(id) do nothing;", (league_id, league_id))
-            for m in matches:
-                mid = upsert_match(cur, league_id, d, m["home"], m["away"], m.get("status","scheduled"))
-                if "prediction" in m:
-                    upsert_prediction(cur, mid, m["prediction"])
-                inserted += 1
-    finally:
-        conn.close()
-    return {"ok": True, "count": inserted, "date": d, "league": league_id}
-
-# =========================
-# Baseline (odds -> probs)
+# Baseline (odds -> probs) + /admin/refresh
 # =========================
 def _inv_safe(x: float | None) -> float | None:
-    if x is None: return None
+    if x is None:
+        return None
     try:
         x = float(x)
-        if x <= 0: return None
+        if x <= 0:
+            return None
         return 1.0 / x
     except Exception:
         return None
 
 def _normalize_triple(a: float | None, b: float | None, c: float | None):
-    vals = [v for v in (a,b,c) if v is not None]
-    if not vals: return None, None, None
+    vals = [v for v in (a, b, c) if v is not None]
+    if not vals:
+        return None, None, None
     s = sum(vals)
-    if s <= 0: return None, None, None
-    def nz(v): return (v/s) if v is not None else None
+    if s <= 0:
+        return None, None, None
+    def nz(v):
+        return (v / s) if v is not None else None
     return nz(a), nz(b), nz(c)
 
 def _odds_to_probs(oh, od, oa):
@@ -275,9 +262,11 @@ def _odds_to_probs(oh, od, oa):
 
 def _odds_to_probs_over25(o, u):
     io, iu = _inv_safe(o), _inv_safe(u)
-    if io is None and iu is None: return None, None
+    if io is None and iu is None:
+        return None, None
     s = (io or 0.0) + (iu or 0.0)
-    if s <= 0: return None, None
+    if s <= 0:
+        return None, None
     return (io or 0.0)/s, (iu or 0.0)/s
 
 @app.post("/admin/refresh", tags=["admin"])
@@ -332,7 +321,11 @@ def admin_refresh(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin
         conn.close()
 
     return {"ok": True, "count": inserted, "date": d, "league": league_id}
-    @app.post("/admin/ingest/odds", tags=["admin"])
+
+# =========================
+# Ingestion (odds, xG) — optionnel mais utile
+# =========================
+@app.post("/admin/ingest/odds", tags=["admin"])
 def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
     """
     Stocke des cotes + crée/MAJ les matches + snapshotte les cotes.
@@ -393,6 +386,7 @@ def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_adm
     finally:
         conn.close()
     return {"ok": True, "snapshots": inserted}
+
 @app.post("/admin/ingest/xg", tags=["admin"])
 def admin_ingest_xg(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
     """
@@ -455,9 +449,8 @@ def admin_ingest_xg(payload: Dict[str, Any] = Body(...), _=Depends(require_admin
 
     return {"ok": True, "xg_upserted": up}
 
-
 # =========================
-# Elo: params & helpers
+# Elo: params & helpers  (UN SEUL BLOC)
 # =========================
 ELO_K = float(os.getenv("ELO_K", "20"))
 ELO_HOME_ADV = float(os.getenv("ELO_HOME_ADV", "60"))  # avantage maison en points
@@ -465,7 +458,8 @@ ELO_HOME_ADV = float(os.getenv("ELO_HOME_ADV", "60"))  # avantage maison en poin
 def _get_team_rating(cur, team: str) -> float:
     cur.execute("select rating from elo_ratings where team=%s;", (team,))
     row = cur.fetchone()
-    if row: return row["rating"] if isinstance(row, dict) else row[0]
+    if row:
+        return row["rating"] if isinstance(row, dict) else row[0]
     cur.execute("insert into elo_ratings(team, rating) values(%s,1500) on conflict(team) do nothing;", (team,))
     return 1500.0
 
@@ -640,7 +634,7 @@ def _gfga_from_row(row: dict, team: str):
 def admin_build_features(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin)):
     """
     Construit les features pour les matchs 'scheduled' d'une date.
-    Table utilisée: match_features(match_id, elo_diff, form_diff_5, gfga_diff_10)
+    Table: match_features(match_id, elo_diff, form_diff_5, gfga_diff_10, updated_at)
     Body: { "date":"YYYY-MM-DD", "league_id":"L1" }
     """
     d = payload["date"]
@@ -769,13 +763,15 @@ def admin_predict_ml(payload: Dict[str, Any] = Body(...), _=Depends(require_admi
         conn.close()
 
     return {"ok": True, "count": inserted, "version": version, "date": d, "league": league_id}
-   
+
+# =========================
+# Metrics: recompute + monthly
+# =========================
 def _safe_log(x: float) -> float:
     x = max(1e-12, min(1.0-1e-12, x if x is not None else 1e-12))
     return math.log(x)
 
 def _brier(pw, pd, pl, w, d, l):
-    # Brier multi-classes : sum (p_i - y_i)^2
     return (pw - w)**2 + (pd - d)**2 + (pl - l)**2
 
 @app.post("/admin/recompute_metrics", tags=["admin"])
@@ -785,7 +781,6 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
     et des prédictions (toutes versions), puis upsert dans model_metrics.
     Body: { "from": "2025-10-01", "to": "2025-10-31" }
     """
-    import math
     from decimal import Decimal
 
     def to_float(x):
@@ -796,13 +791,11 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
     d_from = payload.get("from") or "2025-01-01"
     d_to   = payload.get("to")   or datetime.date.today().isoformat()
 
-    # Prépare l'agg ici (sinon risque de NameError dans le return)
     agg: Dict[tuple, Dict[str, float]] = {}
 
     conn, RealDictCursor = db_conn()
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Récupère matches terminés + prédictions (toutes versions) sur la période
             cur.execute("""
                 SELECT
                   date_trunc('month', m.match_date)::date AS bucket_month,
@@ -820,10 +813,8 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
             rows = cur.fetchall()
 
             if not rows:
-                # Rien à recalculer mais on renvoie ok
                 return {"ok": True, "from": d_from, "to": d_to, "buckets": 0, "note": "aucun match fini dans l'intervalle"}
 
-            # Agrégation en Python
             for r in rows:
                 bm = r["bucket_month"]
                 version = (r["version"] or "unknown")
@@ -837,10 +828,8 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
                 pd = to_float(r["p_draw"])
                 pa = to_float(r["p_away"])
 
-                # Brier multi-classes
                 brier = ((ph - y[0])**2 + (pd - y[1])**2 + (pa - y[2])**2) / 3.0
 
-                # LogLoss = -log(p_true) (clip pour éviter -inf)
                 eps = 1e-15
                 pt = max(min(to_float(p_true), 1.0 - eps), eps)
                 logloss = -math.log(pt)
@@ -852,9 +841,8 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
                 agg[key]["sum_ll"]    += logloss
                 agg[key]["n"]         += 1
 
-            # Upsert dans model_metrics
             for (bm, v), s in agg.items():
-                if s["n"] == 0: 
+                if s["n"] == 0:
                     continue
                 brier = s["sum_brier"] / s["n"]
                 logloss = s["sum_ll"] / s["n"]
@@ -872,14 +860,12 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
 
     return {"ok": True, "from": d_from, "to": d_to, "buckets": len(agg)}
 
-
 @app.get("/metrics/monthly")
 def metrics_monthly():
     """
     Agrège Brier Score et LogLoss par (mois, version) à partir des matches 'finished'.
     Renvoie: [{month:'YYYY-MM-01', version:'elo-v1', n:12, brier:..., logloss:...}, ...]
     """
-    import math
     from decimal import Decimal
 
     def to_float(x):
@@ -909,7 +895,7 @@ def metrics_monthly():
         if not rows:
             return {"items": []}
 
-        agg = {}
+        agg: Dict[tuple, Dict[str, float]] = {}
         for r in rows:
             month = r["month"].isoformat() if hasattr(r["month"], "isoformat") else str(r["month"])
             version = (r["version"] or "unknown")
@@ -923,10 +909,8 @@ def metrics_monthly():
             pd = to_float(r["p_draw"])
             pa = to_float(r["p_away"])
 
-            # Brier multi-classes
             brier = ((ph - y[0])**2 + (pd - y[1])**2 + (pa - y[2])**2) / 3.0
 
-            # LogLoss = -log(p_true clip)
             eps = 1e-15
             p_true_val = to_float(p_true)
             p_true_clip = max(min(p_true_val, 1.0 - eps), eps)
@@ -935,8 +919,8 @@ def metrics_monthly():
             key = (month, version)
             if key not in agg:
                 agg[key] = {"n": 0, "s_brier": 0.0, "s_logloss": 0.0}
-            agg[key]["n"]       += 1
-            agg[key]["s_brier"] += brier
+            agg[key]["n"]         += 1
+            agg[key]["s_brier"]   += brier
             agg[key]["s_logloss"] += logloss
 
         items = []
@@ -953,14 +937,14 @@ def metrics_monthly():
     finally:
         conn.close()
 
-
+# =========================
+# Backfill predictions pour metrics
+# =========================
 @app.post("/admin/backfill_predictions", tags=["admin"])
 def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
     """
-    Crée/MAJ des prédictions 'elo-v1' pour tous les matches FINISHED
-    entre 'from' et 'to' (inclus), afin que /metrics/monthly ait de la matière.
-    Body:
-      { "from": "2025-10-01", "to": "2025-10-31", "version": "elo-v1" }
+    Crée/MAJ des prédictions 'elo-v1' pour tous les matches FINISHED entre 'from' et 'to'.
+    Body: { "from": "2025-10-01", "to": "2025-10-31", "version": "elo-v1" }
     """
     d_from = payload.get("from") or "2025-01-01"
     d_to   = payload.get("to")   or datetime.date.today().isoformat()
@@ -970,7 +954,6 @@ def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(re
     created = 0
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Récupère tous les matches terminés sur la période
             cur.execute("""
                 SELECT id, league_id, match_date, home_team, away_team
                 FROM matches
@@ -985,10 +968,8 @@ def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(re
                 home  = m["home_team"]
                 away  = m["away_team"]
 
-                # Probas via Elo existant
                 p_home, p_draw, p_away, p_over25, p_under25 = _elo_predict_probs(cur, home, away)
 
-                # Upsert prédiction (uq_pred: match_id, version)
                 cur.execute("""
                     INSERT INTO predictions(match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
                     VALUES (%s,%s,%s,%s,%s,%s,%s)
