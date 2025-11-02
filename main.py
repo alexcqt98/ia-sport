@@ -38,7 +38,7 @@ def db_conn():
     import psycopg2
     from psycopg2.extras import RealDictCursor
     return psycopg2.connect(DATABASE_URL), RealDictCursor
-    def _ensure_team(cur, alias: str) -> int:
+  def _ensure_team(cur, alias: str) -> int:
     """
     Mappe un alias d’équipe -> team_id (crée si inconnu).
     """
@@ -56,6 +56,7 @@ def db_conn():
     )
     return team_id
 
+
 def _resolve_team_name(cur, alias: str) -> str:
     """
     Retourne le nom canonique (teams.name) à partir d’un alias, sinon l’alias.
@@ -69,6 +70,7 @@ def _resolve_team_name(cur, alias: str) -> str:
     if not row:
         return alias
     return row["name"] if isinstance(row, dict) else row[0]
+
 
 
 # ========================
