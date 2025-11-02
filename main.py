@@ -38,6 +38,38 @@ def db_conn():
     import psycopg2
     from psycopg2.extras import RealDictCursor
     return psycopg2.connect(DATABASE_URL), RealDictCursor
+    def _ensure_team(cur, alias: str) -> int:
+    """
+    Mappe un alias d’équipe -> team_id (crée si inconnu).
+    """
+    cur.execute("select team_id from team_aliases where alias=%s", (alias,))
+    row = cur.fetchone()
+    if row:
+        return row["team_id"] if isinstance(row, dict) else row[0]
+
+    # crée une team avec ce nom (simple au départ)
+    cur.execute("insert into teams(name) values(%s) returning id", (alias,))
+    team_id = cur.fetchone()[0]
+    cur.execute(
+        "insert into team_aliases(alias, team_id) values(%s,%s) on conflict do nothing",
+        (alias, team_id)
+    )
+    return team_id
+
+def _resolve_team_name(cur, alias: str) -> str:
+    """
+    Retourne le nom canonique (teams.name) à partir d’un alias, sinon l’alias.
+    """
+    cur.execute("""
+        select t.name from team_aliases a
+        join teams t on t.id=a.team_id
+        where a.alias=%s
+    """, (alias,))
+    row = cur.fetchone()
+    if not row:
+        return alias
+    return row["name"] if isinstance(row, dict) else row[0]
+
 
 # ========================
 # Schemas publics
@@ -298,6 +330,129 @@ def admin_refresh(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin
         conn.close()
 
     return {"ok": True, "count": inserted, "date": d, "league": league_id}
+    @app.post("/admin/ingest/odds", tags=["admin"])
+def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Stocke des cotes + crée/MAJ les matches + snapshotte les cotes.
+    Body:
+    {
+      "date":"YYYY-MM-DD", "league_id":"L1", "book":"BookName",
+      "matches":[
+        {"home":"PSG","away":"OM",
+         "odds":{"home":1.70,"draw":3.90,"away":5.00,"over25":1.85,"under25":1.95},
+         "ext":{"provider":"oddsapi","id":"12345"}}
+      ]
+    }
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id", "L1")
+    book = payload.get("book")
+    matches = payload.get("matches", [])
+    if not matches:
+        raise HTTPException(400, "matches vide")
+
+    conn, RealDictCursor = db_conn()
+    inserted = 0
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("insert into leagues(id,name) values(%s,%s) on conflict do nothing", (league_id, league_id))
+            for m in matches:
+                home_alias, away_alias = m["home"], m["away"]
+                _ensure_team(cur, home_alias)
+                _ensure_team(cur, away_alias)
+
+                # upsert match (scheduled par défaut)
+                cur.execute("""
+                    insert into matches(league_id, match_date, home_team, away_team, status)
+                    values (%s,%s,%s,%s,'scheduled')
+                    on conflict on constraint uq_match do update set status=excluded.status
+                    returning id
+                """, (league_id, d, home_alias, away_alias))
+                row = cur.fetchone()
+                match_id = row["id"] if isinstance(row, dict) else row[0]
+
+                # Optionnel: lier un ID externe
+                ext = m.get("ext")
+                if ext and ext.get("provider") and ext.get("id"):
+                    cur.execute("""
+                        insert into match_external_ids(match_id, provider, ext_id)
+                        values (%s,%s,%s)
+                        on conflict (match_id) do update set provider=excluded.provider, ext_id=excluded.ext_id
+                    """, (match_id, ext["provider"], ext["id"]))
+
+                # Snapshot des cotes
+                odds = m.get("odds") or {}
+                cur.execute("""
+                    insert into odds_snapshots(match_id, book, home_odds, draw_odds, away_odds, over25_odds, under25_odds)
+                    values (%s,%s,%s,%s,%s,%s,%s)
+                """, (match_id, book, odds.get("home"), odds.get("draw"), odds.get("away"),
+                      odds.get("over25"), odds.get("under25")))
+                inserted += 1
+    finally:
+        conn.close()
+    return {"ok": True, "snapshots": inserted}
+@app.post("/admin/ingest/xg", tags=["admin"])
+def admin_ingest_xg(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
+    """
+    Ajoute/MAJ les xG par match (utilisé pour features).
+    Body:
+    {
+      "date":"YYYY-MM-DD","league_id":"L1",
+      "matches":[{"home":"PSG","away":"OM","xg_home":2.1,"xg_away":0.8}]
+    }
+    """
+    d = payload["date"]
+    league_id = payload.get("league_id", "L1")
+    matches = payload.get("matches", [])
+    if not matches:
+        raise HTTPException(400, "matches vide")
+
+    conn, RealDictCursor = db_conn()
+    up = 0
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            for m in matches:
+                home, away = m["home"], m["away"]
+
+                # retrouve (ou crée) le match de cette date
+                cur.execute("""
+                    select id from matches
+                    where league_id=%s and match_date=%s and home_team=%s and away_team=%s
+                    limit 1
+                """, (league_id, d, home, away))
+                row = cur.fetchone()
+                if not row:
+                    cur.execute("""
+                        insert into matches(league_id, match_date, home_team, away_team, status)
+                        values (%s,%s,%s,%s,'finished')
+                        on conflict on constraint uq_match do nothing
+                        returning id
+                    """, (league_id, d, home, away))
+                    row = cur.fetchone()
+                    if not row:
+                        cur.execute("""
+                            select id from matches
+                            where league_id=%s and match_date=%s and home_team=%s and away_team=%s
+                            limit 1
+                        """, (league_id, d, home, away))
+                        row = cur.fetchone()
+
+                match_id = row["id"] if isinstance(row, dict) else row[0]
+
+                cur.execute("""
+                    insert into match_xg(match_id, xg_home, xg_away, provider)
+                    values (%s,%s,%s,'manual')
+                    on conflict (match_id) do update set
+                      xg_home=excluded.xg_home,
+                      xg_away=excluded.xg_away,
+                      updated_at=now()
+                """, (match_id, m.get("xg_home"), m.get("xg_away")))
+                up += 1
+    finally:
+        conn.close()
+
+    return {"ok": True, "xg_upserted": up}
+
 
 # =========================
 # Elo: params & helpers
@@ -612,8 +767,7 @@ def admin_predict_ml(payload: Dict[str, Any] = Body(...), _=Depends(require_admi
         conn.close()
 
     return {"ok": True, "count": inserted, "version": version, "date": d, "league": league_id}
-    import math
-
+   
 def _safe_log(x: float) -> float:
     x = max(1e-12, min(1.0-1e-12, x if x is not None else 1e-12))
     return math.log(x)
