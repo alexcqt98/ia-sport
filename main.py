@@ -1,5 +1,5 @@
 import os, datetime, math
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, Query, HTTPException, Header, Body, Depends
 from pydantic import BaseModel
@@ -39,28 +39,41 @@ def db_conn():
     from psycopg2.extras import RealDictCursor
     return psycopg2.connect(DATABASE_URL), RealDictCursor
 
+def _row_get(row, key_or_idx):
+    """Accès sûr aux valeurs de cursor (RealDictCursor ou tuple)."""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row.get(key_or_idx)
+    try:
+        return row[key_or_idx]
+    except Exception:
+        return None
+
 # ========================
-# Team alias helpers (facultatif pour ingestion)
+# Team alias helpers
 # ========================
 def _ensure_team(cur, alias: str) -> int:
     """
     Mappe un alias d’équipe -> team_id (crée si inconnu).
-    Requiert les tables: teams(id serial pk, name text unique), team_aliases(alias text pk, team_id fk).
+    Requiert: teams(id serial pk, name text unique), team_aliases(alias text pk, team_id fk).
     """
     cur.execute("select team_id from team_aliases where alias=%s", (alias,))
     row = cur.fetchone()
     if row:
-        return row["team_id"] if isinstance(row, dict) else row[0]
+        val = _row_get(row, "team_id")
+        if val is None: val = _row_get(row, 0)
+        return int(val)
 
     # crée une team avec ce nom (simple au départ)
     cur.execute("insert into teams(name) values(%s) returning id", (alias,))
-    team_id = cur.fetchone()[0]
+    row2 = cur.fetchone()
+    new_id = int(_row_get(row2, "id") or _row_get(row2, 0))
     cur.execute(
-        "insert into team_aliases(alias, team_id) values(%s,%s) on conflict do nothing",
-        (alias, team_id)
+        "insert into team_aliases(alias, team_id) values(%s,%s) on conflict(alias) do nothing",
+        (alias, new_id)
     )
-    return team_id
-
+    return new_id
 
 def _resolve_team_name(cur, alias: str) -> str:
     """
@@ -75,7 +88,7 @@ def _resolve_team_name(cur, alias: str) -> str:
     row = cur.fetchone()
     if not row:
         return alias
-    return row["name"] if isinstance(row, dict) else row[0]
+    return _row_get(row, "name") or _row_get(row, 0) or alias
 
 # ========================
 # Schemas publics
@@ -162,13 +175,14 @@ def seed():
             """, (match_date,))
             row = cur.fetchone()
             if row:
-                match_id = row[0]
+                match_id = _row_get(row, 0) or _row_get(row, "id")
             else:
                 cur.execute("""
                     select id from matches
                     where league_id='L1' and match_date=%s and home_team='PSG' and away_team='OM' limit 1;
                 """, (match_date,))
-                match_id = cur.fetchone()[0]
+                row = cur.fetchone()
+                match_id = _row_get(row, 0) or _row_get(row, "id")
 
             cur.execute("""
                 insert into predictions(match_id, version, p_home, p_draw, p_away, p_over25, p_under25)
@@ -212,7 +226,7 @@ def upsert_match(cur, league_id: str, d: str, home: str, away: str, status: str)
             where league_id=%s and match_date=%s and home_team=%s and away_team=%s limit 1;
         """, (league_id, d, home, away))
         row = cur.fetchone()
-    return row["id"] if isinstance(row, dict) else row[0]
+    return int(_row_get(row, "id") or _row_get(row, 0))
 
 def upsert_prediction(cur, match_id: int, probs: Dict[str, Any]):
     version = probs.get("version", "v0.1")
@@ -292,15 +306,7 @@ def admin_refresh(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin
                     returning id;
                 """, (league_id, d, home, away, status))
                 row = cur.fetchone()
-                if row:
-                    match_id = row[0] if not isinstance(row, dict) else row.get("id")
-                else:
-                    cur.execute("""
-                        select id from matches where league_id=%s and match_date=%s and home_team=%s and away_team=%s limit 1;
-                    """, (league_id, d, home, away))
-                    row = cur.fetchone()
-                    match_id = row[0] if row and not isinstance(row, dict) else (row.get("id") if row else None)
-
+                match_id = int(_row_get(row, "id") or _row_get(row, 0))
                 odds = (m.get("odds") or {})
                 p_home, p_draw, p_away = _odds_to_probs(odds.get("home"), odds.get("draw"), odds.get("away"))
                 p_over25, p_under25 = _odds_to_probs_over25(odds.get("over25"), odds.get("under25"))
@@ -323,7 +329,7 @@ def admin_refresh(payload: Dict[str, Any] = Body(...), _ = Depends(require_admin
     return {"ok": True, "count": inserted, "date": d, "league": league_id}
 
 # =========================
-# Ingestion (odds, xG) — optionnel mais utile
+# Ingestion (odds, xG)
 # =========================
 @app.post("/admin/ingest/odds", tags=["admin"])
 def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_admin)):
@@ -350,7 +356,7 @@ def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_adm
     inserted = 0
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("insert into leagues(id,name) values(%s,%s) on conflict do nothing", (league_id, league_id))
+            cur.execute("insert into leagues(id,name) values(%s,%s) on conflict(id) do nothing", (league_id, league_id))
             for m in matches:
                 home_alias, away_alias = m["home"], m["away"]
                 _ensure_team(cur, home_alias)
@@ -364,7 +370,7 @@ def admin_ingest_odds(payload: Dict[str, Any] = Body(...), _=Depends(require_adm
                     returning id
                 """, (league_id, d, home_alias, away_alias))
                 row = cur.fetchone()
-                match_id = row["id"] if isinstance(row, dict) else row[0]
+                match_id = int(_row_get(row, "id") or _row_get(row, 0))
 
                 # Optionnel: lier un ID externe
                 ext = m.get("ext")
@@ -433,7 +439,7 @@ def admin_ingest_xg(payload: Dict[str, Any] = Body(...), _=Depends(require_admin
                         """, (league_id, d, home, away))
                         row = cur.fetchone()
 
-                match_id = row["id"] if isinstance(row, dict) else row[0]
+                match_id = int(_row_get(row, "id") or _row_get(row, 0))
 
                 cur.execute("""
                     insert into match_xg(match_id, xg_home, xg_away, provider)
@@ -450,7 +456,7 @@ def admin_ingest_xg(payload: Dict[str, Any] = Body(...), _=Depends(require_admin
     return {"ok": True, "xg_upserted": up}
 
 # =========================
-# Elo: params & helpers  (UN SEUL BLOC)
+# Elo: params & helpers
 # =========================
 ELO_K = float(os.getenv("ELO_K", "20"))
 ELO_HOME_ADV = float(os.getenv("ELO_HOME_ADV", "60"))  # avantage maison en points
@@ -459,7 +465,9 @@ def _get_team_rating(cur, team: str) -> float:
     cur.execute("select rating from elo_ratings where team=%s;", (team,))
     row = cur.fetchone()
     if row:
-        return row["rating"] if isinstance(row, dict) else row[0]
+        val = _row_get(row, "rating")
+        if val is None: val = _row_get(row, 0)
+        return float(val)
     cur.execute("insert into elo_ratings(team, rating) values(%s,1500) on conflict(team) do nothing;", (team,))
     return 1500.0
 
@@ -531,13 +539,6 @@ def admin_record_results(payload: Dict[str, Any] = Body(...), _ = Depends(requir
                     returning id;
                 """, (league_id, d, home, away, gh, ga))
                 row = cur.fetchone()
-                if not row:
-                    cur.execute("""
-                        select id from matches
-                        where league_id=%s and match_date=%s and home_team=%s and away_team=%s limit 1;
-                    """, (league_id, d, home, away))
-                    row = cur.fetchone()
-
                 _elo_update_pair(cur, home, away, gh, ga)
                 updated += 1
     finally:
@@ -573,12 +574,7 @@ def admin_predict_elo(payload: Dict[str, Any] = Body(...), _ = Depends(require_a
                     returning id;
                 """, (league_id, d, home, away, status))
                 row = cur.fetchone()
-                if not row:
-                    cur.execute("""
-                        select id from matches where league_id=%s and match_date=%s and home_team=%s and away_team=%s limit 1;
-                    """, (league_id, d, home, away))
-                    row = cur.fetchone()
-                match_id = row["id"] if isinstance(row, dict) else row[0]
+                match_id = int(_row_get(row, "id") or _row_get(row, 0))
 
                 p_home, p_draw, p_away, p_over25, p_under25 = _elo_predict_probs(cur, home, away)
 
@@ -655,7 +651,9 @@ def admin_build_features(payload: Dict[str, Any] = Body(...), _ = Depends(requir
             def elo(team: str) -> float:
                 cur.execute("select rating from elo_ratings where team=%s;", (team,))
                 row = cur.fetchone()
-                return float(row["rating"]) if row else 1500.0
+                val = _row_get(row, "rating") if row else None
+                if val is None: return 1500.0
+                return float(val)
 
             inserted = 0
             for m in matches:
@@ -688,7 +686,7 @@ def admin_build_features(payload: Dict[str, Any] = Body(...), _ = Depends(requir
                       form_diff_5=excluded.form_diff_5,
                       gfga_diff_10=excluded.gfga_diff_10,
                       updated_at=now();
-                """, (m["id"], elo_diff, form_diff_5, gfga_diff_10))
+                """, (int(_row_get(m, "id") or _row_get(m, 0)), elo_diff, form_diff_5, gfga_diff_10))
                 inserted += 1
     finally:
         conn.close()
@@ -757,7 +755,7 @@ def admin_predict_ml(payload: Dict[str, Any] = Body(...), _=Depends(require_admi
                       p_over25=excluded.p_over25,
                       p_under25=excluded.p_under25,
                       version=excluded.version;
-                """, (r["id"], version, p_home, p_draw, p_away, p_over25, p_under25))
+                """, (int(_row_get(r, "id") or _row_get(r, 0)), version, p_home, p_draw, p_away, p_over25, p_under25))
                 inserted += 1
     finally:
         conn.close()
@@ -791,7 +789,7 @@ def admin_recompute_metrics(payload: Dict[str, Any] = Body(...), _=Depends(requi
     d_from = payload.get("from") or "2025-01-01"
     d_to   = payload.get("to")   or datetime.date.today().isoformat()
 
-    agg: Dict[tuple, Dict[str, float]] = {}
+    agg: Dict[Tuple[datetime.date, str], Dict[str, float]] = {}
 
     conn, RealDictCursor = db_conn()
     try:
@@ -888,14 +886,14 @@ def metrics_monthly():
                 WHERE m.goals_home IS NOT NULL
                   AND m.goals_away IS NOT NULL
                   AND m.status = 'finished'
-                ORDER BY month ASC;
+                ORDER BY month ASC, p.version ASC;
             """)
             rows = cur.fetchall()
 
         if not rows:
             return {"items": []}
 
-        agg: Dict[tuple, Dict[str, float]] = {}
+        agg: Dict[Tuple[str, str], Dict[str, float]] = {}
         for r in rows:
             month = r["month"].isoformat() if hasattr(r["month"], "isoformat") else str(r["month"])
             version = (r["version"] or "unknown")
@@ -964,9 +962,9 @@ def admin_backfill_predictions(payload: Dict[str, Any] = Body(...), _=Depends(re
             rows = cur.fetchall()
 
             for m in rows:
-                mid   = m["id"]
-                home  = m["home_team"]
-                away  = m["away_team"]
+                mid   = int(_row_get(m, "id") or _row_get(m, 0))
+                home  = _row_get(m, "home_team")
+                away  = _row_get(m, "away_team")
 
                 p_home, p_draw, p_away, p_over25, p_under25 = _elo_predict_probs(cur, home, away)
 
