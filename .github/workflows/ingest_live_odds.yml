@@ -1,47 +1,115 @@
 name: Ingest Live Odds
 on:
   schedule:
-    - cron: "0 0 * * *"  # Tous les jours à minuit UTC
+    - cron: "0 0 * * *"    # Tous les jours 00:00 UTC
   workflow_dispatch: {}
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch live odds from The Odds API
-        id: fetch
+      - name: Show curl and openssl versions (debug)
         run: |
-          curl -s "https://api.theoddsapi.com/v4/sports/soccer_france_ligue_one/odds/?apiKey=${{ secrets.ODDS_API_KEY }}&regions=eu&markets=h2h,totals" \
-          -o odds.json
-          cat odds.json
+          curl --version
+          openssl version -a
+
+      - name: Quick connectivity sanity checks (debug)
+        run: |
+          # 1) Test HTTPS générique
+          curl -I --http1.1 https://api.theoddsapi.com/ -sS || true
+          # 2) Test endpoint sports (sans clé) -> doit retourner 401/403 JSON, mais valider SSL/TLS
+          curl -I --http1.1 https://api.theoddsapi.com/v4/sports -sS || true
+
+      - name: Fetch live odds from The Odds API (Ligue 1)
+        id: fetch
+        env:
+          API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${API_KEY:-}" ]; then
+            echo "ODDS_API_KEY is not set"; exit 1
+          fi
+
+          # Sport key correcte pour Ligue 1
+          SPORT_KEY="soccer_france_ligue_1"
+
+          # On force HTTP/1.1 pour éviter certains soucis TLS/ALPN (exit 35)
+          curl --fail --show-error --silent --http1.1 \
+            "https://api.theoddsapi.com/v4/sports/${SPORT_KEY}/odds?apiKey=${API_KEY}&regions=eu&markets=h2h,totals" \
+            -o odds.json
+
+          # Vérif basique du JSON
+          test -s odds.json || (echo "odds.json is empty" && exit 1)
+          head -c 1000 odds.json || true
+          echo
+          echo "::group::odds.json (tail)"
+          tail -n 50 odds.json || true
+          echo "::endgroup::"
 
       - name: Transform JSON for /admin/ingest/odds
         id: transform
         run: |
           python3 <<'PY'
-          import json, datetime
-          raw = json.load(open("odds.json"))
+          import json, datetime, sys
+
+          try:
+              raw = json.load(open("odds.json"))
+          except Exception as e:
+              print("Failed to load odds.json:", e)
+              sys.exit(1)
+
           matches = []
           for m in raw:
-              if "bookmakers" not in m or not m["bookmakers"]:
+              # structure typique V4: id, home_team, away_team, commence_time, bookmakers[]
+              home = m.get("home_team")
+              away = m.get("away_team")
+              if not home or not away:
                   continue
-              bm = m["bookmakers"][0]
-              markets = {mk["key"]: mk for mk in bm.get("markets", [])}
-              home, away = m["home_team"], m["away_team"]
+
+              bookmakers = m.get("bookmakers") or []
+              if not bookmakers:
+                  continue
+
+              bm = bookmakers[0]
+              mkmap = { mk.get("key"): mk for mk in (bm.get("markets") or []) }
+
               odds = {}
-              if "h2h" in markets:
-                  o = markets["h2h"]["outcomes"]
-                  odds = {"home": o[0]["price"], "draw": o[2]["price"], "away": o[1]["price"]}
-              if "totals" in markets and markets["totals"]["outcomes"]:
-                  over25 = next((x["price"] for x in markets["totals"]["outcomes"] if "Over" in x["name"]), None)
-                  under25 = next((x["price"] for x in markets["totals"]["outcomes"] if "Under" in x["name"]), None)
-                  odds["over25"], odds["under25"] = over25, under25
+              # H2H (ordre des outcomes varie, on mappe par name)
+              if "h2h" in mkmap:
+                  out = mkmap["h2h"].get("outcomes") or []
+                  price_home = price_draw = price_away = None
+                  for o in out:
+                      name = (o.get("name") or "").lower()
+                      if "draw" in name:
+                          price_draw = o.get("price")
+                      elif home and o.get("name") == home:
+                          price_home = o.get("price")
+                      elif away and o.get("name") == away:
+                          price_away = o.get("price")
+                  if price_home and price_draw and price_away:
+                      odds.update({"home": price_home, "draw": price_draw, "away": price_away})
+
+              # Totals (prends la ligne la plus proche de 2.5 si dispo)
+              if "totals" in mkmap:
+                  out = mkmap["totals"].get("outcomes") or []
+                  # outcomes: [{"name":"Over 2.5", "price":1.9}, {"name":"Under 2.5", "price":1.95}, ...]
+                  over25 = under25 = None
+                  # On cherche explicitement 2.5
+                  for o in out:
+                      name = (o.get("name") or "").lower()
+                      if "over 2.5" in name:
+                          over25 = o.get("price")
+                      elif "under 2.5" in name:
+                          under25 = o.get("price")
+                  if over25 is not None and under25 is not None:
+                      odds.update({"over25": over25, "under25": under25})
 
               matches.append({
                   "home": home,
                   "away": away,
                   "odds": odds,
-                  "ext": {"provider": "theoddsapi", "id": m["id"]}
+                  "ext": {"provider": "theoddsapi", "id": m.get("id")}
               })
 
           out = {
@@ -50,15 +118,36 @@ jobs:
               "book": "TheOddsAPI",
               "matches": matches
           }
+
           open("payload.json", "w").write(json.dumps(out))
           print(json.dumps(out, indent=2))
           PY
 
-      - name: Send to NovaPredict /admin/ingest/odds
+      - name: Post to NovaPredict /admin/ingest/odds
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          curl -sS -X POST \
+          set -euo pipefail
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "ADMIN_TOKEN is not set"; exit 1
+          fi
+
+          # On logge la taille du payload
+          ls -lh payload.json
+          jq '.matches | length' payload.json || true
+
+          # Envoi
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -X POST \
             "https://ia-sport.onrender.com/admin/ingest/odds" \
             -H "accept: application/json" \
-            -H "x-admin-token: ${{ secrets.ADMIN_TOKEN }}" \
+            -H "x-admin-token: ${ADMIN_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d @payload.json
+            --data-binary @payload.json)
+
+          echo "HTTP_CODE=${HTTP_CODE}"
+          cat resp.json || true
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "Ingestion failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
