@@ -1,0 +1,39 @@
+name: Daily ML Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 6 * * *"  # 06:20 UTC daily
+
+jobs:
+  ml-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build features
+        run: |
+          curl -X POST "$API_BASE/admin/build_features" \
+            -H "accept: application/json" \
+            -H "x-admin-token: $ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"date\":\"$DATE\",\"league_id\":\"$LEAGUE\"}"
+      - name: Predict ML
+        run: |
+          curl -X POST "$API_BASE/admin/predict_ml" \
+            -H "accept: application/json" \
+            -H "x-admin-token: $ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"date\":\"$DATE\",\"league_id\":\"$LEAGUE\",\"version\":\"ml-v1\"}"
+      - name: Recompute Metrics (monthly buckets)
+        run: |
+          curl -X POST "$API_BASE/admin/recompute_metrics" \
+            -H "accept: application/json" \
+            -H "x-admin-token: $ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"from\":\"$FROM\",\"to\":\"$TO\"}"
+    env:
+      API_BASE: https://ia-sport.onrender.com
+      ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+      DATE: ${{ secrets.PIPELINE_DATE }}      # ex: 2025-10-29
+      LEAGUE: ${{ secrets.PIPELINE_LEAGUE }}  # ex: L1
+      FROM: ${{ secrets.METRICS_FROM }}       # ex: 2025-10-01
+      TO:   ${{ secrets.METRICS_TO }}         # ex: 2025-10-31
