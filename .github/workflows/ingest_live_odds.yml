@@ -1,0 +1,64 @@
+name: Ingest Live Odds
+on:
+  schedule:
+    - cron: "0 0 * * *"  # Tous les jours à minuit UTC
+  workflow_dispatch: {}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch live odds from The Odds API
+        id: fetch
+        run: |
+          curl -s "https://api.theoddsapi.com/v4/sports/soccer_france_ligue_one/odds/?apiKey=${{ secrets.ODDS_API_KEY }}&regions=eu&markets=h2h,totals" \
+          -o odds.json
+          cat odds.json
+
+      - name: Transform JSON for /admin/ingest/odds
+        id: transform
+        run: |
+          python3 <<'PY'
+          import json, datetime
+          raw = json.load(open("odds.json"))
+          matches = []
+          for m in raw:
+              if "bookmakers" not in m or not m["bookmakers"]:
+                  continue
+              bm = m["bookmakers"][0]
+              markets = {mk["key"]: mk for mk in bm.get("markets", [])}
+              home, away = m["home_team"], m["away_team"]
+              odds = {}
+              if "h2h" in markets:
+                  o = markets["h2h"]["outcomes"]
+                  odds = {"home": o[0]["price"], "draw": o[2]["price"], "away": o[1]["price"]}
+              if "totals" in markets and markets["totals"]["outcomes"]:
+                  over25 = next((x["price"] for x in markets["totals"]["outcomes"] if "Over" in x["name"]), None)
+                  under25 = next((x["price"] for x in markets["totals"]["outcomes"] if "Under" in x["name"]), None)
+                  odds["over25"], odds["under25"] = over25, under25
+
+              matches.append({
+                  "home": home,
+                  "away": away,
+                  "odds": odds,
+                  "ext": {"provider": "theoddsapi", "id": m["id"]}
+              })
+
+          out = {
+              "date": str(datetime.date.today()),
+              "league_id": "L1",
+              "book": "TheOddsAPI",
+              "matches": matches
+          }
+          open("payload.json", "w").write(json.dumps(out))
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Send to NovaPredict /admin/ingest/odds
+        run: |
+          curl -sS -X POST \
+            "https://ia-sport.onrender.com/admin/ingest/odds" \
+            -H "accept: application/json" \
+            -H "x-admin-token: ${{ secrets.ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
